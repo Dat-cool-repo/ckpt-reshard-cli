@@ -1,0 +1,75 @@
+[package]
+name = "ckpt-reshard-cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+memmap2 = "0.9"
+rayon = "1"
+
+[dependencies.ckpt-reshard-cli]
+path = ".."
+
+# Each target feeds one kind of hostile input to the readers; see "Testing" in the top-level
+# README for how to run them and fuzz/make_seeds.py for the seed corpora.
+
+[[bin]]
+name = "pickle"
+path = "fuzz_targets/pickle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcp_metadata"
+path = "fuzz_targets/dcp_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "torch_save"
+path = "fuzz_targets/torch_save.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safetensors"
+path = "fuzz_targets/safetensors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hf_index"
+path = "fuzz_targets/hf_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcp_dir"
+path = "fuzz_targets/dcp_dir.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "megatron"
+path = "fuzz_targets/megatron.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deepspeed"
+path = "fuzz_targets/deepspeed.rs"
+test = false
+doc = false
+bench = false
