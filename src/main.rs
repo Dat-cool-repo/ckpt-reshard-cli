@@ -500,6 +500,13 @@ fn run() -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    // Like other Unix CLIs: when the reader of a pipe goes away (`ckpt inspect x | head`), die from
+    // SIGPIPE quietly instead of failing a write to stdout.
+    #[cfg(unix)]
+    // SAFETY: called before any other thread exists; SIG_DFL is a valid action for SIGPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Defence in depth: the readers return errors for malformed input, but should any input still
     // reach a panic, report it as an error (exit code 2) rather than a crash (exit code 101).
     std::panic::set_hook(Box::new(|info| {
@@ -509,6 +516,10 @@ fn main() -> ExitCode {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic".into());
+        if msg.starts_with("failed printing to std") {
+            // the output pipe was closed (e.g. `| head` on Windows): nothing useful to report
+            return;
+        }
         let at = info
             .location()
             .map(|l| format!(" at {}:{}", l.file(), l.line()))

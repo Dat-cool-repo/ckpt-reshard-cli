@@ -621,6 +621,23 @@ fn hf_index_hostile() {
     }
 }
 
+#[test]
+fn closed_stdout_is_not_an_internal_error() {
+    // `ckpt inspect big | head`: the reader closes the pipe early
+    use std::process::Stdio;
+    let fix = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny/dcp_fsdp");
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .args(["inspect", "--chunks", s(&fix)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(c.stdout.take());
+    let o = c.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("internal error"), "{err}");
+}
+
 // ------------------------------------------------------------------ fuzzer findings
 
 /// Every input in `tests/fuzz_regressions/<target>/` (crashes found by `cargo fuzz`, minimized) must

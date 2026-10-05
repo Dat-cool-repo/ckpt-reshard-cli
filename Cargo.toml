@@ -2,15 +2,27 @@
 name = "ckpt-reshard-cli"
 version = "0.1.0"
 edition = "2024"
+# Verified: builds and tests compile with 1.88.0 (`--locked`); 1.87 lacks let-chains.
+rust-version = "1.88"
 description = "ckpt: inspect, convert, reshard and diff ML checkpoints (safetensors, HF sharded, PyTorch DCP/FSDP, Megatron-LM, DeepSpeed ZeRO) without Python or torch"
 license = "MIT OR Apache-2.0"
 authors = ["Dat-cool-repo contributors"]
 repository = "https://github.com/Dat-cool-repo/ckpt-reshard-cli"
-homepage = "https://github.com/Dat-cool-repo/ckpt-reshard-cli"
 readme = "README.md"
 keywords = ["checkpoint", "safetensors", "pytorch", "megatron", "deepspeed"]
 categories = ["command-line-utilities", "science"]
-exclude = ["/data", "/.github"]
+# Only what is needed to build and document the crate: the test fixtures, fuzz crate and dev scripts
+# stay in the repository.
+include = [
+    "/src/**/*.rs",
+    "/examples/*.yaml",
+    "/docs/*.md",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/Cargo.toml",
+    "/Cargo.lock",
+]
 
 [[bin]]
 name = "ckpt"
@@ -30,6 +42,10 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+# only to restore the default SIGPIPE action (`ckpt inspect ... | head` exits quietly)
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
