@@ -5,3 +5,4 @@ tests/fixtures/** -text -diff
 *.distcp binary
 *.pt binary
 .metadata binary
+tests/fuzz_regressions/** -text -diff

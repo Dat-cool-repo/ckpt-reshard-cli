@@ -61,6 +61,8 @@ pub struct Pickle {
     pub root: Value,
     /// Node visits left for [`Pickle::to_json`], shared by all calls on this pickle.
     json_budget: Cell<u64>,
+    /// String bytes left for [`Pickle::to_json`] (a memoised string can be referenced many times).
+    json_bytes: Cell<u64>,
 }
 
 /// Which globals a pickle may reference. Each format gets the smallest list that its real
@@ -195,6 +197,10 @@ pub const MAX_MARKS: usize = 1 << 16;
 pub const MAX_MEMO: usize = MAX_NODES;
 /// Total node visits of all [`Pickle::to_json`] calls on one pickle.
 const JSON_BUDGET: u64 = 1_000_000;
+/// Total string bytes copied by all [`Pickle::to_json`] calls on one pickle.
+const JSON_BYTES: u64 = 64 << 20;
+/// Longest rendering of a non-string dict key.
+const KEY_CHARS: usize = 128;
 
 pub fn load(data: &[u8], allow: Allow) -> Result<Pickle> {
     let mut vm = Vm {
@@ -214,6 +220,7 @@ pub fn load(data: &[u8], allow: Allow) -> Result<Pickle> {
         nodes: vm.nodes,
         root,
         json_budget: Cell::new(JSON_BUDGET),
+        json_bytes: Cell::new(JSON_BYTES),
     })
 }
 
@@ -833,6 +840,16 @@ impl Pickle {
     pub fn to_json(&self, v: &Value) -> serde_json::Value {
         self.to_json_depth(v, 0)
     }
+    fn take_bytes(&self, n: usize) -> bool {
+        let left = self.json_bytes.get();
+        match left.checked_sub(n as u64) {
+            Some(r) => {
+                self.json_bytes.set(r);
+                true
+            }
+            None => false,
+        }
+    }
     fn to_json_depth(&self, v: &Value, depth: usize) -> serde_json::Value {
         if depth > 32 {
             return json!("<too deep>");
@@ -847,7 +864,10 @@ impl Pickle {
             Value::Bool(b) => json!(b),
             Value::Int(i) => json!(i),
             Value::Float(f) => json!(f),
-            Value::Str(s) => json!(&**s),
+            Value::Str(s) => match self.take_bytes(s.len()) {
+                true => json!(&**s),
+                false => json!("<truncated>"),
+            },
             Value::Bytes(b) => json!(format!("<{} bytes>", b.len())),
             Value::Ref(i) => match &self.nodes[*i] {
                 Node::Tuple(x) | Node::List(x) | Node::Set(x) => serde_json::Value::Array(
@@ -856,9 +876,17 @@ impl Pickle {
                 Node::Dict(d) => {
                     let mut m = serde_json::Map::new();
                     for (k, val) in d {
+                        // a non-string key is rendered as (short) JSON text; without the cap, keys
+                        // nested in keys double in length at every level through quote escaping
                         let key = match k {
-                            Value::Str(s) => s.to_string(),
-                            other => self.to_json_depth(other, depth + 1).to_string(),
+                            Value::Str(s) if self.take_bytes(s.len()) => s.to_string(),
+                            Value::Str(_) => "<truncated>".to_string(),
+                            other => self
+                                .to_json_depth(other, depth + 1)
+                                .to_string()
+                                .chars()
+                                .take(KEY_CHARS)
+                                .collect(),
                         };
                         m.insert(key, self.to_json_depth(val, depth + 1));
                     }

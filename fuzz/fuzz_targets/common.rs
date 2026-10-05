@@ -47,6 +47,10 @@ fn check(n: usize) {
             &mut std::io::stderr(),
             b"\n==ckpt-fuzz== allocation over 256 MiB requested\n",
         );
+        // set CKPT_FUZZ_BT=1 when replaying a crash to see where it came from
+        if std::env::var_os("CKPT_FUZZ_BT").is_some() {
+            eprintln!("{n} bytes\n{}", std::backtrace::Backtrace::force_capture());
+        }
         std::process::abort();
     }
 }

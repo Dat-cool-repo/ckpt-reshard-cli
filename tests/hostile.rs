@@ -417,6 +417,38 @@ fn deeply_nested_pickle() {
 }
 
 #[test]
+fn nested_dict_keys() {
+    // D_0 = {"a": "b"}, D_i = {D_{i-1}: "v"}: rendering a key as JSON escapes the quotes of the key
+    // inside it, so without a cap the text doubles at every level (found by the torch_save fuzzer)
+    let td = tempfile::tempdir().unwrap();
+    let mut p = P::new();
+    p.op(b"}(")
+        .str("w")
+        .op(b"}(")
+        .str("a")
+        .str("b")
+        .op(b"uq\x000");
+    for i in 1..=40u8 {
+        p.op(&[b'}', b'(', b'h', i - 1])
+            .str("v")
+            .op(&[b'u', b'q', i, b'0']);
+    }
+    let pk = p.op(&[b'h', 40, b'u']).stop();
+    let f = write(td.path(), "keys.pt", &torch_save(&pk, &[]));
+    let t = Instant::now();
+    let o = ckpt(&["inspect", "--json", s(&f)]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(matches!(o.status.code(), Some(0) | Some(2)), "{err}");
+    assert!(!err.contains("internal error"), "{err}");
+    assert!(
+        o.stdout.len() < 1 << 20,
+        "inspect printed {} bytes",
+        o.stdout.len()
+    );
+    assert!(t.elapsed() < Duration::from_secs(20));
+}
+
+#[test]
 fn memo_reference_abuse() {
     let td = tempfile::tempdir().unwrap();
     // a 100k-item list in memo slot 0, then `set(memo[0])` 1000 times: 10^8 copied values
@@ -610,7 +642,12 @@ fn fuzz_regressions() {
             let td = tempfile::tempdir().unwrap();
             let path = place(&target, &data, &fix, td.path());
             let Some(path) = path else { continue };
-            let o = ckpt(&["inspect", "--json", s(&path)]);
+            // --raw: a DeepSpeed *_states.pt file is read on its own, as the torch_save target does
+            let mut args = vec!["inspect", "--json", s(&path)];
+            if target == "torch_save" {
+                args.insert(0, "--raw");
+            }
+            let o = ckpt(&args);
             let err = String::from_utf8_lossy(&o.stderr);
             assert!(
                 matches!(o.status.code(), Some(0) | Some(2)),
@@ -651,7 +688,12 @@ fn place(target: &str, data: &[u8], fix: &Path, td: &Path) -> Option<PathBuf> {
             std::fs::write(td.join(".metadata"), body).unwrap();
             Some(td.to_path_buf())
         }
-        "torch_save" => Some(write(td, "x.pt", body)),
+        // the first byte picks the allowlist; the file name selects the same one in the CLI
+        "torch_save" => Some(match sel % 3 {
+            0 => write(td, "x.pt", body),
+            1 => write(td, "model_optim_rng.pt", body),
+            _ => write(td, "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt", body),
+        }),
         "safetensors" => Some(write(td, "x.safetensors", data)),
         "hf_index" => {
             copy_dir(&fix.join("hf_sharded"), td);
