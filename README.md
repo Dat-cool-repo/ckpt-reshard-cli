@@ -88,10 +88,11 @@ See [docs/MOTIVATION.md](docs/MOTIVATION.md) for the background and a survey of 
 
 ## Install
 
-From GitHub (installs the `ckpt` binary into `~/.cargo/bin`):
+From GitHub (installs the `ckpt` binary into `~/.cargo/bin`; the trailing package name is needed
+because the repository also contains the `fuzz/` crate):
 
 ```bash
-cargo install --git https://github.com/Dat-cool-repo/ckpt-reshard-cli
+cargo install --git https://github.com/Dat-cool-repo/ckpt-reshard-cli ckpt-reshard-cli
 ```
 
 From source:
