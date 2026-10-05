@@ -836,15 +836,7 @@ impl Checkpoint {
             let m = &self.files[f].map;
             let e = e.min(m.len() as u64);
             if e > s {
-                // SAFETY: read-only shared file mapping; DONTNEED only drops resident pages,
-                // later accesses re-fault identical contents from the file.
-                let _ = unsafe {
-                    m.unchecked_advise_range(
-                        memmap2::UncheckedAdvice::DontNeed,
-                        s as usize,
-                        (e - s) as usize,
-                    )
-                };
+                drop_resident_pages(m, s as usize, (e - s) as usize);
             }
         }
     }
@@ -1181,6 +1173,21 @@ pub fn copy_chunk(
         }
     }
 }
+
+/// Drop a range of a read-only file mapping from our resident set (the pages stay in the
+/// page cache; later accesses re-fault identical contents from the file).
+#[cfg(unix)]
+fn drop_resident_pages(m: &memmap2::Mmap, offset: usize, len: usize) {
+    // SAFETY: read-only shared file mapping; DONTNEED only drops resident pages,
+    // later accesses re-fault identical contents from the file.
+    let _ = unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) };
+}
+
+/// madvise has no counterpart for file mappings in memmap2 on this platform. Clean pages of a
+/// read-only file mapping are trimmed from the working set by the OS under memory pressure, so
+/// this is only a resident-memory hint and skipping it does not affect correctness.
+#[cfg(not(unix))]
+fn drop_resident_pages(_m: &memmap2::Mmap, _offset: usize, _len: usize) {}
 
 #[cfg(test)]
 mod tests {
