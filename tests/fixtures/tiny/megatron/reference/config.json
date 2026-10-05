@@ -1,0 +1,10 @@
+{
+ "orig_vocab_size": 50,
+ "padded_vocab_size": 64,
+ "tp": 2,
+ "pp": 2,
+ "num_layers": 2,
+ "num_attention_heads": 4,
+ "num_query_groups": 2,
+ "kv_channels": 4
+}

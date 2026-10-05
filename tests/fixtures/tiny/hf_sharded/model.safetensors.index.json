@@ -1,0 +1,25 @@
+{
+  "metadata": {
+    "total_parameters": 4624,
+    "total_size": 18496
+  },
+  "weight_map": {
+    "lm_head.weight": "model-00006-of-00006.safetensors",
+    "transformer.h.0.attn.c_attn.bias": "model-00002-of-00006.safetensors",
+    "transformer.h.0.attn.c_attn.weight": "model-00002-of-00006.safetensors",
+    "transformer.h.0.attn.c_proj.bias": "model-00005-of-00006.safetensors",
+    "transformer.h.0.attn.c_proj.weight": "model-00005-of-00006.safetensors",
+    "transformer.h.0.ln_1.bias": "model-00001-of-00006.safetensors",
+    "transformer.h.0.ln_1.weight": "model-00001-of-00006.safetensors",
+    "transformer.h.0.ln_2.bias": "model-00005-of-00006.safetensors",
+    "transformer.h.0.ln_2.weight": "model-00005-of-00006.safetensors",
+    "transformer.h.0.mlp.c_fc.bias": "model-00005-of-00006.safetensors",
+    "transformer.h.0.mlp.c_fc.weight": "model-00003-of-00006.safetensors",
+    "transformer.h.0.mlp.c_proj.bias": "model-00005-of-00006.safetensors",
+    "transformer.h.0.mlp.c_proj.weight": "model-00004-of-00006.safetensors",
+    "transformer.ln_f.bias": "model-00005-of-00006.safetensors",
+    "transformer.ln_f.weight": "model-00005-of-00006.safetensors",
+    "transformer.wpe.weight": "model-00001-of-00006.safetensors",
+    "transformer.wte.weight": "model-00001-of-00006.safetensors"
+  }
+}

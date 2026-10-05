@@ -1,0 +1,7 @@
+* text=auto eol=lf
+# Test checkpoints are binary (pickles, zip archives, safetensors) and must be byte-exact.
+tests/fixtures/** -text -diff
+*.safetensors binary
+*.distcp binary
+*.pt binary
+.metadata binary

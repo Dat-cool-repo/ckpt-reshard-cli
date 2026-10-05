@@ -1,0 +1,21 @@
+# Megatron-style tensor-parallel layout for HF GPT-2 (Conv1D weights are [in, out]).
+# First matching rule wins. `parts: 3` = fused q,k,v: each of the 3 blocks is split separately,
+# so every rank gets its own slice of q, k and v (not "all of q" on rank 0).
+default: replicate
+rules:
+  - pattern: "*.attn.c_attn.weight"   # column parallel (output dim = 1 for Conv1D)
+    dim: 1
+    parts: 3
+  - pattern: "*.attn.c_attn.bias"
+    dim: 0
+    parts: 3
+  - pattern: "*.attn.c_proj.weight"   # row parallel (input dim = 0 for Conv1D)
+    dim: 0
+  - pattern: "*.mlp.c_fc.weight"      # column parallel
+    dim: 1
+  - pattern: "*.mlp.c_fc.bias"
+    dim: 0
+  - pattern: "*.mlp.c_proj.weight"    # row parallel
+    dim: 0
+  # biases of row-parallel layers, layer norms, embeddings: replicated (default)
+  # vocab-parallel embeddings would be:  - {pattern: "*wte.weight", dim: 0}

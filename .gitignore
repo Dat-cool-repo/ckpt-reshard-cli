@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+**/*.rs.bk
+**/*.tmp-ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env/
+env/
+
+# Generated fixtures, benchmark data and big-test scratch (CKPT_DATA_DIR defaults to ./data)
+/data/
+/fixtures/
+/bench/
+/scratch/
+
+# Checkpoints anywhere outside the committed tiny test fixtures
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.distcp
+*.ckpt
+!/tests/fixtures/tiny/**
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
