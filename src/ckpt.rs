@@ -8,7 +8,7 @@ use crate::safetensors::parse_header;
 use anyhow::{Context, Result, anyhow, bail};
 use memmap2::Mmap;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -90,7 +90,10 @@ impl ViewPart {
     /// Restrict the view to `[start, start+len)` along `dim` (placement is left as is).
     pub fn narrow(&self, dim: usize, start: u64, len: u64) -> ViewPart {
         let mut v = self.clone();
-        v.storage_offset += start * self.strides[dim];
+        // saturating: an absurd result is caught by the bounds check in `part_view`
+        v.storage_offset = start
+            .saturating_mul(self.strides[dim])
+            .saturating_add(v.storage_offset);
         v.sizes[dim] = len;
         v
     }
@@ -141,7 +144,7 @@ impl TensorInfo {
         numel(&self.shape)
     }
     pub fn nbytes(&self) -> u64 {
-        self.numel() * self.dtype.size() as u64
+        self.numel().saturating_mul(self.dtype.size() as u64)
     }
 }
 
@@ -228,7 +231,164 @@ impl Checkpoint {
     pub fn open_with(path: &Path, o: &OpenOpts) -> Result<Checkpoint> {
         let mut ck = Self::open_inner(path, o, 0)?;
         ck.path = path.to_path_buf();
+        ck.validate()?;
         Ok(ck)
+    }
+
+    /// Check every tensor's declared geometry against the mapped files before anything is
+    /// allocated or read: shapes must pass [`crate::dtype::checked_nbytes`]; chunk, part and piece
+    /// offsets must lie inside their tensors and files (overflow-checked); and a tensor may not
+    /// declare more bytes than the files holding its data contain, so a hostile header cannot make
+    /// `read` allocate more memory than the checkpoint occupies on disk.
+    pub fn validate(&self) -> Result<()> {
+        for (in_base, t) in self
+            .tensors
+            .iter()
+            .map(|t| (false, t))
+            .chain(self.base.iter().map(|t| (true, t)))
+        {
+            self.validate_tensor(t, in_base)
+                .with_context(|| format!("tensor {}", t.name))?;
+        }
+        Ok(())
+    }
+
+    fn file_len(&self, f: usize) -> Result<u64> {
+        self.files
+            .get(f)
+            .map(|m| m.map.len() as u64)
+            .ok_or_else(|| anyhow!("internal: file index {f} out of range"))
+    }
+
+    /// Files holding the data of `t` (through the base tensors for derived ones).
+    fn files_of(&self, t: &TensorInfo, out: &mut BTreeSet<usize>) {
+        match &t.loc {
+            Loc::Contig { file, .. } => {
+                out.insert(*file);
+            }
+            Loc::Dcp { chunks } => out.extend(chunks.iter().map(|c| c.file)),
+            Loc::Views { parts } => out.extend(parts.iter().map(|p| p.file)),
+            Loc::Derived { pieces } => {
+                for p in pieces {
+                    if let Some(b) = self.base.get(p.base)
+                        && !matches!(b.loc, Loc::Derived { .. })
+                    {
+                        self.files_of(b, out);
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_tensor(&self, t: &TensorInfo, in_base: bool) -> Result<()> {
+        let nbytes = crate::dtype::checked_nbytes(&t.shape, t.dtype)?;
+        let rank = t.shape.len();
+        let inside = |off: &[u64], size: &[u64], shape: &[u64]| {
+            off.len() == shape.len()
+                && size.len() == shape.len()
+                && (0..shape.len())
+                    .all(|d| off[d].checked_add(size[d]).is_some_and(|e| e <= shape[d]))
+        };
+        match &t.loc {
+            Loc::Contig { file, start, end } => {
+                if start > end || *end > self.file_len(*file)? || end - start != nbytes {
+                    bail!("byte range [{start}, {end}) does not fit its file and shape");
+                }
+            }
+            Loc::Dcp { chunks } => {
+                for c in chunks {
+                    let flen = self.file_len(c.file)?;
+                    crate::dtype::checked_nbytes(&c.meta.sizes, t.dtype)?;
+                    if !inside(&c.meta.offsets, &c.meta.sizes, &t.shape) {
+                        bail!(
+                            "chunk {:?}+{:?} is outside the tensor shape {:?}",
+                            c.meta.offsets,
+                            c.meta.sizes,
+                            t.shape
+                        );
+                    }
+                    if c.info
+                        .offset
+                        .checked_add(c.info.length)
+                        .is_none_or(|e| e > flen)
+                    {
+                        bail!(
+                            "chunk storage [{}, +{}) is outside {} ({flen} bytes)",
+                            c.info.offset,
+                            c.info.length,
+                            c.info.relative_path
+                        );
+                    }
+                }
+            }
+            Loc::Views { parts } => {
+                for p in parts {
+                    let flen = self.file_len(p.file)?;
+                    if p.sizes.len() != p.strides.len() {
+                        bail!("view sizes/strides rank mismatch");
+                    }
+                    crate::dtype::checked_nbytes(&p.sizes, t.dtype)?;
+                    if p.storage_start
+                        .checked_add(p.storage_len)
+                        .is_none_or(|e| e > flen)
+                    {
+                        bail!("storage is outside its file");
+                    }
+                    match &p.place {
+                        Place::Block(off) => {
+                            if !inside(off, &p.sizes, &t.shape) {
+                                bail!(
+                                    "part {:?}+{:?} is outside the tensor shape {:?}",
+                                    off,
+                                    p.sizes,
+                                    t.shape
+                                );
+                            }
+                        }
+                        Place::Linear(off) => {
+                            if off
+                                .checked_add(numel(&p.sizes))
+                                .is_none_or(|e| e > t.numel())
+                            {
+                                bail!("flat part at {off} is outside the tensor");
+                            }
+                        }
+                    }
+                }
+            }
+            Loc::Derived { pieces } => {
+                if in_base {
+                    bail!("internal: derived base tensor");
+                }
+                for p in pieces {
+                    let b = self
+                        .base
+                        .get(p.base)
+                        .ok_or_else(|| anyhow!("internal: base index out of range"))?;
+                    if !inside(&p.start, &p.size, &b.shape) || p.size.len() < rank {
+                        bail!("piece {:?}+{:?} is outside {:?}", p.start, p.size, b.shape);
+                    }
+                    let drop = p.size.len() - rank;
+                    if !inside(&p.out_offset, &p.size[drop..], &t.shape) {
+                        bail!("piece output {:?} is outside {:?}", p.out_offset, t.shape);
+                    }
+                }
+            }
+        }
+        let mut files = BTreeSet::new();
+        self.files_of(t, &mut files);
+        let mut avail = 0u64;
+        for f in files {
+            avail = avail.saturating_add(self.file_len(f)?);
+        }
+        if nbytes > avail {
+            bail!(
+                "declares {nbytes} bytes (shape {:?} x {}) but the files holding it have only {avail} bytes",
+                t.shape,
+                t.dtype
+            );
+        }
+        Ok(())
     }
 
     fn open_inner(path: &Path, o: &OpenOpts, depth: usize) -> Result<Checkpoint> {
@@ -326,17 +486,19 @@ impl Checkpoint {
         let wm = js["weight_map"]
             .as_object()
             .ok_or_else(|| anyhow!("index has no weight_map"))?;
-        let mut files: Vec<String> = Vec::new();
+        let mut files: BTreeSet<String> = BTreeSet::new();
         for v in wm.values() {
             let f = v.as_str().ok_or_else(|| anyhow!("bad weight_map value"))?;
-            if f.contains('/') || f.contains('\\') || f.contains("..") {
+            if f.is_empty()
+                || f.contains('/')
+                || f.contains('\\')
+                || f.contains("..")
+                || f.contains(':')
+            {
                 bail!("suspicious shard file name {f:?} in index");
             }
-            if !files.iter().any(|x| x == f) {
-                files.push(f.to_string());
-            }
+            files.insert(f.to_string());
         }
-        files.sort();
         let paths = files.iter().map(|f| dir.join(f)).collect();
         let ck = Self::open_safetensors_files(&dir, paths, Format::HfSharded)?;
         // consistency check between index and shard headers
@@ -371,12 +533,24 @@ impl Checkpoint {
         paths: Vec<PathBuf>,
         format: Format,
     ) -> Result<Checkpoint> {
+        let maps = paths
+            .into_iter()
+            .map(|p| mmap_file(&p))
+            .collect::<Result<Vec<_>>>()?;
+        Self::open_safetensors_maps(root, maps, format)
+    }
+
+    /// Safetensors files that are already mapped (the files' paths are only used in messages).
+    pub fn open_safetensors_maps(
+        root: &Path,
+        maps: Vec<MappedFile>,
+        format: Format,
+    ) -> Result<Checkpoint> {
         let mut files = Vec::new();
         let mut tensors = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut seen = HashMap::new();
-        for (fi, p) in paths.into_iter().enumerate() {
-            let map = mmap(&p)?;
+        for (fi, MappedFile { path: p, map }) in maps.into_iter().enumerate() {
             let h = parse_header(&map).with_context(|| format!("reading {}", p.display()))?;
             if fi == 0 {
                 metadata = h.metadata.clone();
@@ -407,7 +581,12 @@ impl Checkpoint {
 
     /// A single torch.save file: every tensor in the pickle tree under its dotted path.
     pub fn open_torch_save(path: &Path, allow: Allow) -> Result<Checkpoint> {
-        let mf = mmap_file(path)?;
+        Self::open_torch_save_map(mmap_file(path)?, allow)
+    }
+
+    /// A single torch.save file that is already mapped.
+    pub fn open_torch_save_map(mf: MappedFile, allow: Allow) -> Result<Checkpoint> {
+        let path = mf.path.clone();
         let ts = crate::torchsave::TorchSave::open(&mf.map, allow)
             .with_context(|| format!("reading {}", path.display()))?;
         let mut col = crate::torchsave::Collected::default();
@@ -502,10 +681,14 @@ impl Checkpoint {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.tensors.iter().map(|t| t.nbytes()).sum()
+        self.tensors
+            .iter()
+            .fold(0u64, |a, t| a.saturating_add(t.nbytes()))
     }
     pub fn total_params(&self) -> u64 {
-        self.tensors.iter().map(|t| t.numel()).sum()
+        self.tensors
+            .iter()
+            .fold(0u64, |a, t| a.saturating_add(t.numel()))
     }
 
     /// Return the full tensor as contiguous row-major little-endian bytes.
@@ -513,7 +696,10 @@ impl Checkpoint {
     pub fn read(&self, t: &TensorInfo) -> Result<Cow<'_, [u8]>> {
         match &t.loc {
             Loc::Contig { file, start, end } => Ok(Cow::Borrowed(
-                &self.files[*file].map[*start as usize..*end as usize],
+                self.files[*file]
+                    .map
+                    .get(*start as usize..*end as usize)
+                    .ok_or_else(|| anyhow!("{}: data out of bounds", t.name))?,
             )),
             Loc::Dcp { chunks } => {
                 if let Some(b) = self.single_contig_chunk(t, chunks)? {
@@ -539,7 +725,9 @@ impl Checkpoint {
                         return Ok(Cow::Borrowed(b));
                     }
                 }
-                let covered: u64 = parts.iter().map(|p| numel(&p.sizes)).sum();
+                let covered = parts
+                    .iter()
+                    .fold(0u64, |a, p| a.saturating_add(numel(&p.sizes)));
                 if covered != t.numel() {
                     bail!(
                         "{}: parts cover {covered} of {} elements",
@@ -554,7 +742,9 @@ impl Checkpoint {
                 Ok(Cow::Owned(buf))
             }
             Loc::Derived { pieces } => {
-                let covered: u64 = pieces.iter().map(|p| numel(&p.size)).sum();
+                let covered = pieces
+                    .iter()
+                    .fold(0u64, |a, p| a.saturating_add(numel(&p.size)));
                 if covered != t.numel() {
                     bail!(
                         "{}: pieces cover {covered} of {} elements",
@@ -575,7 +765,8 @@ impl Checkpoint {
                         bail!("{}: piece rank below tensor rank", t.name);
                     }
                     let drop = p.size.len() - t.shape.len();
-                    if p.size[..drop].iter().any(|&x| x != 1) {
+                    if p.size[..drop].iter().any(|&x| x != 1) || p.out_offset.len() != t.shape.len()
+                    {
                         bail!("{}: dropped dims of a piece must have size 1", t.name);
                     }
                     let boxb = self.read_box(b, &p.start, &p.size)?;
@@ -603,7 +794,11 @@ impl Checkpoint {
                     .and_then(|x| x.checked_add(max))
                     .ok_or_else(|| anyhow!("view overflow"))?;
             }
-            if (max + 1) * dtype.size() as u64 > p.storage_len {
+            if max
+                .checked_add(1)
+                .and_then(|x| x.checked_mul(dtype.size() as u64))
+                .is_none_or(|b| b > p.storage_len)
+            {
                 bail!(
                     "view exceeds its storage ({} bytes) as {dtype}",
                     p.storage_len
@@ -626,17 +821,25 @@ impl Checkpoint {
                 if off.len() != t.shape.len() || p.sizes.len() != t.shape.len() {
                     bail!("{}: part rank mismatch", t.name);
                 }
-                if (0..t.shape.len()).any(|d| off[d] + p.sizes[d] > t.shape[d]) {
+                if (0..t.shape.len()).any(|d| {
+                    off[d]
+                        .checked_add(p.sizes[d])
+                        .is_none_or(|e| e > t.shape[d])
+                }) {
                     bail!("{}: part out of bounds", t.name);
                 }
                 copy_chunk(buf, &t.shape, off, &v)
             }
             Place::Linear(off) => {
-                let es = t.dtype.size();
-                let n = numel(&p.sizes) as usize;
-                let s = *off as usize * es;
-                let dst = buf
-                    .get_mut(s..s + n * es)
+                let es = t.dtype.size() as u64;
+                let range = off
+                    .checked_mul(es)
+                    .zip(numel(&p.sizes).checked_mul(es))
+                    .and_then(|(s, n)| {
+                        Some(usize::try_from(s).ok()?..usize::try_from(s.checked_add(n)?).ok()?)
+                    });
+                let dst = range
+                    .and_then(|r| buf.get_mut(r))
                     .ok_or_else(|| anyhow!("{}: flat part out of bounds", t.name))?;
                 if let Some(b) = v.contiguous_bytes() {
                     dst.copy_from_slice(b);
@@ -657,7 +860,7 @@ impl Checkpoint {
             bail!("{}: box rank mismatch", t.name);
         }
         for d in 0..n {
-            if start[d] + size[d] > t.shape[d] {
+            if start[d].checked_add(size[d]).is_none_or(|e| e > t.shape[d]) {
                 bail!(
                     "{}: box {:?}+{:?} out of bounds of {:?}",
                     t.name,
@@ -678,7 +881,10 @@ impl Checkpoint {
                 start: s,
                 end,
             } => {
-                let st = &self.files[*file].map[*s as usize..*end as usize];
+                let st = self.files[*file]
+                    .map
+                    .get(*s as usize..*end as usize)
+                    .ok_or_else(|| anyhow!("{}: data out of bounds", t.name))?;
                 copy_box(
                     &mut buf,
                     start,
@@ -740,7 +946,9 @@ impl Checkpoint {
     }
 
     fn check_coverage(&self, t: &TensorInfo, chunks: &[DcpChunk]) -> Result<()> {
-        let total: u64 = chunks.iter().map(|c| numel(&c.meta.sizes)).sum();
+        let total = chunks
+            .iter()
+            .fold(0u64, |a, c| a.saturating_add(numel(&c.meta.sizes)));
         if total != t.numel() {
             bail!(
                 "{}: chunks cover {} of {} elements (incomplete or overlapping shards)",
@@ -814,12 +1022,20 @@ impl Checkpoint {
             Loc::Contig { file, start, end } => ranges.push((*file, *start, *end)),
             Loc::Dcp { chunks } => {
                 for c in chunks {
-                    ranges.push((c.file, c.info.offset, c.info.offset + c.info.length));
+                    ranges.push((
+                        c.file,
+                        c.info.offset,
+                        c.info.offset.saturating_add(c.info.length),
+                    ));
                 }
             }
             Loc::Views { parts } => {
                 for p in parts {
-                    ranges.push((p.file, p.storage_start, p.storage_start + p.storage_len));
+                    ranges.push((
+                        p.file,
+                        p.storage_start,
+                        p.storage_start.saturating_add(p.storage_len),
+                    ));
                 }
             }
             Loc::Derived { pieces } => {
@@ -899,13 +1115,16 @@ impl Checkpoint {
                 return Ok(());
             }
             let m = &self.files[file].map;
-            let s = start as usize;
-            let e = match len {
-                Some(l) => s + l as usize,
-                None => m.len(),
-            };
-            let b = m
-                .get(s..e)
+            let b = start
+                .checked_add(len.unwrap_or(0))
+                .and_then(|e| {
+                    let s = usize::try_from(start).ok()?;
+                    let e = match len {
+                        Some(_) => usize::try_from(e).ok()?,
+                        None => m.len(),
+                    };
+                    m.get(s..e)
+                })
                 .ok_or_else(|| anyhow!("archive out of bounds"))?;
             if !crate::zipread::is_zip(b) {
                 return Ok(());
@@ -976,18 +1195,22 @@ fn slab_order(t: &TensorInfo, chunks: &[DcpChunk]) -> Option<Vec<usize>> {
         };
     }
     for c in chunks {
-        if c.meta.offsets[1..].iter().any(|&o| o != 0) || c.meta.sizes[1..] != t.shape[1..] {
+        if c.meta.offsets.len() != t.shape.len()
+            || c.meta.sizes.len() != t.shape.len()
+            || c.meta.offsets[1..].iter().any(|&o| o != 0)
+            || c.meta.sizes[1..] != t.shape[1..]
+        {
             return None;
         }
     }
     let mut order: Vec<usize> = (0..chunks.len()).collect();
     order.sort_by_key(|&i| chunks[i].meta.offsets[0]);
-    let mut next = 0;
+    let mut next = 0u64;
     for &i in &order {
         if chunks[i].meta.offsets[0] != next {
             return None;
         }
-        next += chunks[i].meta.sizes[0];
+        next = next.saturating_add(chunks[i].meta.sizes[0]);
     }
     if next != t.shape[0] {
         return None;
@@ -1006,6 +1229,7 @@ fn view_slab_order(t: &TensorInfo, parts: &[ViewPart]) -> Option<Vec<usize>> {
             return None;
         };
         if off.len() != t.shape.len()
+            || p.sizes.len() != t.shape.len()
             || off[1..].iter().any(|&o| o != 0)
             || p.sizes[1..] != t.shape[1..]
         {
@@ -1014,18 +1238,20 @@ fn view_slab_order(t: &TensorInfo, parts: &[ViewPart]) -> Option<Vec<usize>> {
         keyed.push((off[0], i));
     }
     keyed.sort();
-    let mut next = 0;
+    let mut next = 0u64;
     for &(o, i) in &keyed {
         if o != next {
             return None;
         }
-        next += parts[i].sizes[0];
+        next = next.saturating_add(parts[i].sizes[0]);
     }
     (next == t.shape[0]).then(|| keyed.into_iter().map(|(_, i)| i).collect())
 }
 
 fn intersects(off: &[u64], sz: &[u64], start: &[u64], size: &[u64]) -> bool {
-    (0..off.len()).all(|d| off[d] < start[d] + size[d] && start[d] < off[d] + sz[d])
+    (0..off.len()).all(|d| {
+        off[d] < start[d].saturating_add(size[d]) && start[d] < off[d].saturating_add(sz[d])
+    })
 }
 
 /// Row-major contiguous view over `b` with shape `shape`.
@@ -1033,7 +1259,7 @@ pub fn contiguous_view<'a>(b: &'a [u8], shape: &[u64], dtype: DType) -> ChunkVie
     let n = shape.len();
     let mut strides = vec![1u64; n];
     for d in (0..n.saturating_sub(1)).rev() {
-        strides[d] = strides[d + 1] * shape[d + 1];
+        strides[d] = strides[d + 1].saturating_mul(shape[d + 1]);
     }
     ChunkView {
         storage: b,
@@ -1066,14 +1292,22 @@ fn copy_box(
         };
         let mut dst_off = vec![0u64; n];
         let mut empty = false;
+        if off.len() != n || v.sizes.len() != n || v.strides.len() != n {
+            bail!("internal: block rank mismatch");
+        }
         for d in 0..n {
             let lo = off[d].max(start[d]);
-            let hi = (off[d] + v.sizes[d]).min(start[d] + size[d]);
+            let hi = off[d]
+                .saturating_add(v.sizes[d])
+                .min(start[d].saturating_add(size[d]));
             if lo >= hi {
                 empty = true;
                 break;
             }
-            sub.storage_offset += (lo - off[d]) * v.strides[d];
+            sub.storage_offset = (lo - off[d])
+                .checked_mul(v.strides[d])
+                .and_then(|x| x.checked_add(sub.storage_offset))
+                .ok_or_else(|| anyhow!("view offset overflow"))?;
             sub.sizes[d] = hi - lo;
             dst_off[d] = lo - start[d];
         }
@@ -1106,13 +1340,50 @@ pub fn copy_chunk(
 ) -> Result<()> {
     let es = v.dtype.size();
     let n = full_shape.len();
+    if v.sizes.len() != n || v.strides.len() != n || offsets.len() != n {
+        bail!("internal: view rank does not match the destination rank");
+    }
+    let oob = || anyhow!("tensor view out of bounds (corrupt or malicious checkpoint)");
+    // element index -> byte offset, overflow-checked
+    let at = |i: u64| -> Option<usize> { usize::try_from(i).ok()?.checked_mul(es) };
     if n == 0 {
-        let s = v.storage_offset as usize * es;
-        dst[..es].copy_from_slice(&v.storage[s..s + es]);
+        let s = at(v.storage_offset).ok_or_else(oob)?;
+        let src = v
+            .storage
+            .get(s..s.checked_add(es).ok_or_else(oob)?)
+            .ok_or_else(oob)?;
+        dst.get_mut(..es).ok_or_else(oob)?.copy_from_slice(src);
         return Ok(());
     }
     if numel(&v.sizes) == 0 {
         return Ok(());
+    }
+    // Bounds of the whole copy, checked up front with overflow-checked arithmetic: the block must lie
+    // inside the destination shape, the destination buffer must hold that shape, and the view's
+    // largest linear index must lie inside its storage. Every index computed below is then in range.
+    let mut src_max = v.storage_offset;
+    for d in 0..n {
+        if offsets[d]
+            .checked_add(v.sizes[d])
+            .is_none_or(|e| e > full_shape[d])
+        {
+            return Err(oob());
+        }
+        src_max = (v.sizes[d] - 1)
+            .checked_mul(v.strides[d])
+            .and_then(|x| x.checked_add(src_max))
+            .ok_or_else(oob)?;
+    }
+    if src_max
+        .checked_add(1)
+        .and_then(at)
+        .is_none_or(|e| e > v.storage.len())
+    {
+        return Err(oob());
+    }
+    let full_bytes = crate::dtype::checked_nbytes(full_shape, v.dtype)?;
+    if full_bytes > dst.len() as u64 {
+        return Err(oob());
     }
     // destination strides (elements)
     let mut dstr = vec![1u64; n];
@@ -1149,13 +1420,19 @@ pub fn copy_chunk(
             let s = so as usize * es;
             let ds = d_o as usize * es;
             let len = run as usize * es;
-            dst[ds..ds + len].copy_from_slice(&v.storage[s..s + len]);
+            let src = v.storage.get(s..s + len).ok_or_else(oob)?;
+            dst.get_mut(ds..ds + len)
+                .ok_or_else(oob)?
+                .copy_from_slice(src);
         } else {
             // elementwise along last dim (k == n-1 here)
             for j in 0..v.sizes[n - 1] {
                 let s = (so + j * v.strides[n - 1]) as usize * es;
                 let ds = (d_o + j) as usize * es;
-                dst[ds..ds + es].copy_from_slice(&v.storage[s..s + es]);
+                let src = v.storage.get(s..s + es).ok_or_else(oob)?;
+                dst.get_mut(ds..ds + es)
+                    .ok_or_else(oob)?
+                    .copy_from_slice(src);
             }
         }
         // increment outer index

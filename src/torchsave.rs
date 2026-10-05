@@ -205,6 +205,7 @@ impl TorchSave {
         if sizes.len() != strides.len() {
             bail!("{path}: sizes/strides rank mismatch");
         }
+        crate::dtype::checked_nbytes(&sizes, dtype).with_context(|| path.to_string())?;
         if numel(&sizes) > 0 {
             let mut max_idx = storage_offset;
             for (s, st) in sizes.iter().zip(&strides) {
@@ -244,6 +245,11 @@ impl TorchSave {
 
     /// Walk `v` and collect every tensor (dotted path) plus small scalar leaves.
     pub fn collect(&self, v: &Value, prefix: &str, out: &mut Collected) -> Result<()> {
+        // Shared references make the pickle a DAG that can describe an exponentially large tree;
+        // a real state dict visits each node about once (tied weights a few times).
+        out.visits_left = (self.pickle.nodes.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(4096);
         self.walk(v, prefix, out, 0)
     }
 
@@ -251,24 +257,31 @@ impl TorchSave {
         if depth > 64 {
             bail!("{path}: pickle nested too deeply");
         }
+        out.visits_left = out.visits_left.checked_sub(1).ok_or_else(|| {
+            anyhow!("pickle object graph too large to walk (shared-reference bomb?)")
+        })?;
         let pk = &self.pickle;
         if let Some(t) = self.tensor_at(v, path)? {
             out.tensors.push(t);
             return Ok(());
         }
-        let join = |k: &str| {
-            if path.is_empty() {
+        let join = |k: &str| -> Result<String> {
+            if path.len() + k.len() >= MAX_PATH {
+                let short: String = path.chars().take(64).collect();
+                bail!("{short}...: tensor name longer than {MAX_PATH} bytes");
+            }
+            Ok(if path.is_empty() {
                 k.to_string()
             } else {
                 format!("{path}.{k}")
-            }
+            })
         };
         match v {
             Value::Ref(_) => match pk.node(v) {
                 Some(Node::Dict(d)) => {
                     for (k, val) in d {
                         let ks = key_str(pk, k);
-                        self.walk(val, &join(&ks), out, depth + 1)?;
+                        self.walk(val, &join(&ks)?, out, depth + 1)?;
                     }
                 }
                 Some(Node::List(x)) | Some(Node::Tuple(x)) => {
@@ -280,7 +293,7 @@ impl TorchSave {
                         return Ok(());
                     }
                     for (i, val) in x.iter().enumerate() {
-                        self.walk(val, &join(&i.to_string()), out, depth + 1)?;
+                        self.walk(val, &join(&i.to_string())?, out, depth + 1)?;
                     }
                 }
                 Some(Node::Object { .. }) => {
@@ -300,11 +313,15 @@ impl TorchSave {
     }
 }
 
+/// Longest dotted tensor path accepted from a pickle (real names are a few hundred bytes at most).
+pub const MAX_PATH: usize = 1024;
+
 pub fn key_str(pk: &Pickle, k: &Value) -> String {
     match k {
         Value::Str(s) => s.to_string(),
         Value::Int(i) => i.to_string(),
-        other => pk.to_json(other).to_string(),
+        // a container key renders as JSON; keep it short
+        other => pk.to_json(other).to_string().chars().take(128).collect(),
     }
 }
 
@@ -312,6 +329,8 @@ pub fn key_str(pk: &Pickle, k: &Value) -> String {
 pub struct Collected {
     pub tensors: Vec<TsTensor>,
     pub scalars: Vec<(String, serde_json::Value)>,
+    /// node visits left in the current `collect` walk
+    visits_left: u64,
 }
 
 /// Decode a small (non-tensor) torch.save blob to JSON (e.g. Megatron's `common_state` item).

@@ -294,6 +294,9 @@ impl Rules {
                 sec.rows = sec.heads * hd;
             }
         }
+        if s.pad_multiple == Some(0) || s.parts == 0 {
+            bail!("{name}: pad_multiple and parts must be at least 1");
+        }
         if s.pad_multiple.is_some() {
             s.orig_len = Some(len);
         }
@@ -490,9 +493,46 @@ fn full_len(s: &Split, shard: u64, tp: usize) -> u64 {
         return o;
     }
     if !s.sections.is_empty() {
-        return s.sections.iter().map(|x| x.rows).sum();
+        return s
+            .sections
+            .iter()
+            .fold(0u64, |a, x| a.saturating_add(x.rows));
     }
-    shard * tp as u64
+    shard.saturating_mul(tp as u64)
+}
+
+/// Sanity-check a split read from `tp_plan.json` (or inferred from rules) against a rank shard of
+/// shape `shard`, so that merging cannot divide by zero, overflow or allocate more than the
+/// rank files hold.
+fn check_split(s: &Split, shard: &[u64], dtype: DType, tp: usize, name: &str) -> Result<()> {
+    const BIG: u64 = 1 << 40;
+    if s.dim >= shard.len() {
+        bail!(
+            "{name}: split dim {} out of range for shape {shard:?}",
+            s.dim
+        );
+    }
+    if s.parts == 0 || s.parts as u64 > BIG {
+        bail!("{name}: invalid parts {}", s.parts);
+    }
+    if let Some(m) = s.pad_multiple
+        && (m == 0 || m > BIG)
+    {
+        bail!("{name}: invalid pad_multiple {m}");
+    }
+    if s.sections.iter().any(|x| x.rows > BIG || x.heads > BIG) {
+        bail!("{name}: invalid sections");
+    }
+    let mut full = shard.to_vec();
+    full[s.dim] = full_len(s, shard[s.dim], tp);
+    let full_bytes = crate::dtype::checked_nbytes(&full, dtype)?;
+    let shard_bytes = crate::dtype::checked_nbytes(shard, dtype)?;
+    if full_bytes > shard_bytes.saturating_mul(tp as u64) {
+        bail!(
+            "{name}: the plan implies a full shape {full:?} larger than the {tp} rank shards of {shard:?}"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -609,21 +649,33 @@ impl Source {
                         }
                         let mut buf = vec![0u8; numel(&full_shape) as usize * es];
                         for (r, p) in parts.iter().enumerate() {
-                            let mut pos = 0;
+                            let mut pos = 0usize;
                             for g in shard_segments(&full_shape, es, &s, tp, r, &t0.name)? {
                                 match g {
                                     Seg::Data {
                                         off,
                                         len,
                                         primary: true,
-                                    } => buf[off..off + len].copy_from_slice(&p[pos..pos + len]),
+                                    } => buf
+                                        .get_mut(off..off.saturating_add(len))
+                                        .zip(p.get(pos..pos.saturating_add(len)))
+                                        .map(|(d, s)| d.copy_from_slice(s))
+                                        .ok_or_else(|| {
+                                            anyhow!("{}: shard layout out of bounds", t0.name)
+                                        })?,
                                     Seg::Data {
                                         off,
                                         len,
                                         primary: false,
                                     } => {
                                         // ranks are visited in order, so the primary copy is already in buf
-                                        if buf[off..off + len] != p[pos..pos + len] {
+                                        let (Some(d), Some(s)) = (
+                                            buf.get(off..off.saturating_add(len)),
+                                            p.get(pos..pos.saturating_add(len)),
+                                        ) else {
+                                            bail!("{}: shard layout out of bounds", t0.name);
+                                        };
+                                        if d != s {
                                             bail!(
                                                 "{}: replicated kv head differs on tp rank {r}",
                                                 t0.name
@@ -692,7 +744,8 @@ pub fn open_tp(dir: &Path, rules: Option<&Rules>) -> Result<Source> {
         }
         TpPlan { tp, tensors }
     } else if plan_path.is_file() {
-        let p: TpPlan = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
+        let p: TpPlan = serde_json::from_slice(&std::fs::read(&plan_path)?)
+            .with_context(|| format!("parsing {}", plan_path.display()))?;
         if p.tp != tp {
             bail!("tp_plan.json says tp={} but found {tp} rank dirs", p.tp);
         }
@@ -700,6 +753,11 @@ pub fn open_tp(dir: &Path, rules: Option<&Rules>) -> Result<Source> {
     } else {
         bail!("{}: no tp_plan.json; pass --rules", dir.display());
     };
+    for t in &ranks[0].tensors {
+        if let Some(Some(s)) = plan.tensors.get(&t.name) {
+            check_split(s, &t.shape, t.dtype, tp, &t.name)?;
+        }
+    }
     Ok(Source::Tp { ranks, plan })
 }
 
@@ -726,6 +784,9 @@ fn full_split_from_shard(s: &Split, shard: u64, tp: usize) -> Result<Split> {
         }
     }
     // shard = hd * units_num / tp
+    if units_num == 0 {
+        bail!("the rule's sections have no heads");
+    }
     if !(shard * tp64).is_multiple_of(units_num) {
         bail!("shard length {shard} does not fit the rule's head layout");
     }

@@ -99,13 +99,17 @@ fn shapes_of(ts: &TorchSave, v: &Value) -> Result<Vec<(String, Vec<u64>)>> {
         .ok_or_else(|| anyhow!("param_shapes entry is not a dict"))?;
     d.iter()
         .map(|(k, s)| {
+            let name = key_str(pk, k);
             let shape = pk
                 .int_list(s)
-                .ok_or_else(|| anyhow!("bad shape"))?
+                .ok_or_else(|| anyhow!("{name}: bad shape"))?
                 .into_iter()
-                .map(|x| u64::try_from(x).map_err(|_| anyhow!("negative dim")))
+                .map(|x| u64::try_from(x).map_err(|_| anyhow!("{name}: negative dim")))
                 .collect::<Result<Vec<u64>>>()?;
-            Ok((key_str(pk, k), shape))
+            // the fp32 partitions are F32; the shape must be a sane F32 tensor
+            crate::dtype::checked_nbytes(&shape, crate::dtype::DType::F32)
+                .with_context(|| name.clone())?;
+            Ok((name, shape))
         })
         .collect()
 }
@@ -138,7 +142,7 @@ fn flat_part(file: usize, t: &TsTensor, start: u64, len: u64, at: u64) -> Result
     if t.sizes.len() != 1 {
         bail!("{}: flat partition is not 1-D", t.path);
     }
-    if start + len > t.sizes[0] {
+    if start.checked_add(len).is_none_or(|e| e > t.sizes[0]) {
         bail!("{}: flat partition too short", t.path);
     }
     Ok(ViewPart::from_ts(file, t, Place::Linear(at)).narrow(0, start, len))
@@ -239,6 +243,23 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
         }
         flat.push((*f, list));
     }
+    // every rank must hold the same param groups; stage 3 partitions are equal-sized per group
+    for (r, (_, l)) in flat.iter().enumerate() {
+        if l.len() != flat[0].1.len() {
+            bail!(
+                "rank {r} has {} fp32 param groups but rank 0 has {}",
+                l.len(),
+                flat[0].1.len()
+            );
+        }
+        if stage == 3 {
+            for (g, t) in l.iter().enumerate() {
+                if t.numel() != flat[0].1[g].numel() {
+                    bail!("ZeRO-3 group {g}: rank {r} partition size differs from rank 0");
+                }
+            }
+        }
+    }
     let paddings: Option<Vec<Vec<u64>>> = match get0("param_alignment_paddings") {
         Some(v) if !matches!(v, Value::None) => {
             let groups = o0
@@ -253,7 +274,12 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
                             .seq(g)
                             .map(|x| {
                                 x.iter()
-                                    .map(|y| o0.pickle.as_int(y).unwrap_or(0) as u64)
+                                    .map(|y| {
+                                        o0.pickle
+                                            .as_int(y)
+                                            .and_then(|v| u64::try_from(v).ok())
+                                            .unwrap_or(0)
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default()
@@ -311,7 +337,7 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
     {
         let shapes = shapes_of(m0, fs)?;
         for (name, shape) in shapes {
-            let n: u64 = shape.iter().product();
+            let n: u64 = crate::dtype::numel(&shape);
             let mut parts = Vec::new();
             let mut fdtype = None;
             let frag = |ms: &ModelStates| -> Result<TsTensor> {
@@ -369,7 +395,7 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
                         let flat_t = flatten_ts(&t);
                         parts.push(flat_part(ms.file, &flat_t, 0, len, at)?);
                     }
-                    at += len;
+                    at = at.saturating_add(len);
                 }
                 if at != n {
                     bail!("frozen param {name}: fragments hold {at} of {n} elements");
@@ -399,24 +425,24 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
             let mut avail = 0u64;
             for (_, parts) in &flat {
                 starts.push(avail);
-                avail += parts[g].numel();
+                avail = avail.saturating_add(parts[g].numel());
             }
             let mut offset = 0u64;
             for (pi, (name, shape)) in shapes.iter().enumerate() {
-                let n: u64 = shape.iter().product();
+                let n: u64 = crate::dtype::numel(shape);
+                if offset.checked_add(n).is_none_or(|e| e > avail) {
+                    bail!("param {name} runs past the end of group {g}'s fp32 partitions");
+                }
                 let mut parts = Vec::new();
                 for (r, (f, ranks)) in flat.iter().enumerate() {
                     let t = &ranks[g];
                     let (lo, hi) = (
                         offset.max(starts[r]),
-                        (offset + n).min(starts[r] + t.numel()),
+                        (offset + n).min(starts[r].saturating_add(t.numel())),
                     );
                     if lo < hi {
                         parts.push(flat_part(*f, t, lo - starts[r], hi - lo, lo - offset)?);
                     }
-                }
-                if offset + n > avail {
-                    bail!("param {name} runs past the end of group {g}'s fp32 partitions");
                 }
                 ck.tensors.push(TensorInfo {
                     name: name.clone(),
@@ -425,13 +451,14 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
                     loc: Loc::Views { parts },
                 });
                 offset += n;
-                total += n;
+                total = total.saturating_add(n);
                 if let Some(p) = &paddings {
-                    offset += p.get(g).and_then(|x| x.get(pi)).copied().unwrap_or(0);
+                    offset = offset
+                        .saturating_add(p.get(g).and_then(|x| x.get(pi)).copied().unwrap_or(0));
                 }
             }
             let align = 2 * ws as u64;
-            let a = |x: u64| x.div_ceil(align) * align;
+            let a = |x: u64| x.div_ceil(align).saturating_mul(align);
             if a(offset) != a(avail) {
                 bail!(
                     "group {g}: consumed {offset} numels out of {avail} -- param_shapes do not match the partitions"
@@ -443,15 +470,21 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
         let group_starts: Vec<u64> = {
             let mut v = vec![0u64];
             for t in &flat[0].1 {
-                v.push(v.last().unwrap() + t.numel());
+                v.push(v.last().unwrap().saturating_add(t.numel()));
             }
             v
         };
-        let avail = *group_starts.last().unwrap() * ws as u64;
+        let avail = group_starts.last().unwrap().saturating_mul(ws as u64);
         let mut offset = 0u64;
         for (name, shape) in param_shapes.iter().flatten() {
-            let n: u64 = shape.iter().product();
+            let n: u64 = crate::dtype::numel(shape);
             let pn = n.div_ceil(ws as u64);
+            if offset
+                .checked_add(pn)
+                .is_none_or(|e| e > *group_starts.last().unwrap())
+            {
+                bail!("param {name} runs past the fp32 partitions");
+            }
             let mut parts = Vec::new();
             for (r, (f, groups)) in flat.iter().enumerate() {
                 // elements [r*pn, (r+1)*pn) of the param live at [offset, offset+pn) of rank r's flat
@@ -464,6 +497,7 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
                         .position(|w| w[0] <= pos && pos < w[1])
                         .ok_or_else(|| anyhow!("param {name} runs past the fp32 partitions"))?;
                     let in_g = pos - group_starts[g];
+                    // groups[g] has the same size as rank 0's (checked above), so len >= 1
                     let len = (want - got).min(groups[g].numel() - in_g);
                     parts.push(flat_part(*f, &groups[g], in_g, len, r as u64 * pn + got)?);
                     got += len;
@@ -476,12 +510,12 @@ pub fn open(dir: &Path) -> Result<Checkpoint> {
                 loc: Loc::Views { parts },
             });
             offset += pn;
-            total += n;
+            total = total.saturating_add(n);
         }
-        if offset * ws as u64 != avail {
+        if offset.saturating_mul(ws as u64) != avail {
             bail!(
                 "consumed {} numels out of {avail} -- param_shapes do not match the partitions",
-                offset * ws as u64
+                offset.saturating_mul(ws as u64)
             );
         }
     }
@@ -526,4 +560,13 @@ fn flatten_ts(t: &TsTensor) -> TsTensor {
     f.sizes = vec![t.numel()];
     f.strides = vec![1];
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn natural_order() {
+        assert!(natural_key("zero_pp_rank_2_mp") < natural_key("zero_pp_rank_10_mp"));
+    }
 }

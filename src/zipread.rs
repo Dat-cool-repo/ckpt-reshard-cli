@@ -1,6 +1,12 @@
 //! Minimal read-only ZIP reader for `torch.save` archives (stored entries only, ZIP64 aware).
 //! Works on an in-memory / mmapped byte slice and returns sub-slices, never copies.
 //!
+//! Hostile archives: every offset and length is bounds- and overflow-checked against the buffer,
+//! compressed entries are refused (so there is nothing to inflate and no zip bomb), and entries
+//! whose data overlaps another entry's, or that repeat a name, are refused. torch.save never
+//! writes either, and overlapping entries would let a small file make `--verify` hash the same
+//! bytes millions of times.
+//!
 //! CRC32: every entry records the CRC from the central directory. With `--verify`
 //! (`set_verify(true)`), every entry whose data is used is checked against it
 //! (`ZipEntry::checked_data`), so silent corruption is reported instead of read.
@@ -53,18 +59,22 @@ impl<'a> ZipEntry<'a> {
     }
 }
 
+fn span(o: usize, n: usize) -> std::ops::Range<usize> {
+    // an overflowing range is empty (start > end), so `get` returns None
+    o..o.checked_add(n).unwrap_or(0)
+}
 fn rd16(b: &[u8], o: usize) -> Result<u16> {
-    b.get(o..o + 2)
+    b.get(span(o, 2))
         .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
         .ok_or_else(|| anyhow::anyhow!("zip: truncated"))
 }
 fn rd32(b: &[u8], o: usize) -> Result<u32> {
-    b.get(o..o + 4)
+    b.get(span(o, 4))
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
         .ok_or_else(|| anyhow::anyhow!("zip: truncated"))
 }
 fn rd64(b: &[u8], o: usize) -> Result<u64> {
-    b.get(o..o + 8)
+    b.get(span(o, 8))
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         .ok_or_else(|| anyhow::anyhow!("zip: truncated"))
 }
@@ -98,15 +108,15 @@ pub fn entries(b: &[u8]) -> Result<Vec<ZipEntry<'_>>> {
         && eocd >= 20
         && rd32(b, eocd - 20)? == 0x0706_4b50
     {
-        let z64 = rd64(b, eocd - 20 + 8)? as usize;
+        let z64 = usize::try_from(rd64(b, eocd - 20 + 8)?).unwrap_or(usize::MAX);
         if rd32(b, z64)? != 0x0606_4b50 {
             bail!("zip: bad zip64 EOCD");
         }
         count = rd64(b, z64 + 32)?;
         cd_off = rd64(b, z64 + 48)?;
     }
-    let mut out = Vec::new();
-    let mut p = cd_off as usize;
+    let mut out: Vec<ZipEntry> = Vec::new();
+    let mut p = usize::try_from(cd_off).unwrap_or(usize::MAX);
     for _ in 0..count {
         if rd32(b, p)? != 0x0201_4b50 {
             bail!("zip: bad central directory entry");
@@ -120,7 +130,7 @@ pub fn entries(b: &[u8]) -> Result<Vec<ZipEntry<'_>>> {
         let clen = rd16(b, p + 32)? as usize;
         let mut lho = rd32(b, p + 42)? as u64;
         let name = String::from_utf8_lossy(
-            b.get(p + 46..p + 46 + nlen)
+            b.get(span(p + 46, nlen))
                 .ok_or_else(|| anyhow::anyhow!("zip: truncated"))?,
         )
         .to_string();
@@ -154,15 +164,16 @@ pub fn entries(b: &[u8]) -> Result<Vec<ZipEntry<'_>>> {
         if csize != usize_ {
             bail!("zip: entry {name} size mismatch");
         }
-        let l = lho as usize;
+        let l = usize::try_from(lho).unwrap_or(usize::MAX);
         if rd32(b, l)? != 0x0403_4b50 {
             bail!("zip: bad local header for {name}");
         }
         let lnlen = rd16(b, l + 26)? as usize;
         let lxlen = rd16(b, l + 28)? as usize;
         let start = l + 30 + lnlen + lxlen;
-        let end = start
-            .checked_add(usize_ as usize)
+        let end = usize::try_from(usize_)
+            .ok()
+            .and_then(|n| start.checked_add(n))
             .ok_or_else(|| anyhow::anyhow!("zip: overflow"))?;
         if end > b.len() {
             bail!("zip: entry {name} out of bounds");
@@ -174,6 +185,24 @@ pub fn entries(b: &[u8]) -> Result<Vec<ZipEntry<'_>>> {
             crc32,
         });
         p += 46 + nlen + xlen + clen;
+    }
+    // refuse overlapping entry data and repeated names
+    let mut order: Vec<usize> = (0..out.len()).collect();
+    order.sort_by_key(|&i| (out[i].offset, out[i].data.len()));
+    for w in order.windows(2) {
+        let (a, c) = (&out[w[0]], &out[w[1]]);
+        if !a.data.is_empty() && a.offset + a.data.len() > c.offset {
+            bail!(
+                "zip: entries {:?} and {:?} overlap (malformed or hostile archive)",
+                a.name,
+                c.name
+            );
+        }
+    }
+    let mut names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+        bail!("zip: duplicate entry name {:?}", w[0]);
     }
     Ok(out)
 }

@@ -500,11 +500,29 @@ fn run() -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(c) => c,
-        Err(e) => {
+    // Defence in depth: the readers return errors for malformed input, but should any input still
+    // reach a panic, report it as an error (exit code 2) rather than a crash (exit code 101).
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        let at = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!(
+            "error: internal error{at}: {msg} (the input may be malformed; please report this at https://github.com/Dat-cool-repo/ckpt-reshard-cli/issues)"
+        );
+    }));
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             eprintln!("error: {e:#}");
             ExitCode::from(2)
         }
+        Err(_) => ExitCode::from(2),
     }
 }

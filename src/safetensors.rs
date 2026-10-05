@@ -22,10 +22,15 @@ pub struct StHeader {
     pub header_len: u64,
 }
 
-const MAX_HEADER: u64 = 512 * 1024 * 1024;
+/// Largest accepted JSON header (the same limit as the reference `safetensors` crate).
+const MAX_HEADER: u64 = 100_000_000;
 
 /// Parse a safetensors header from `buf` (which starts at the safetensors blob).
 /// Entries are returned in file (offset) order with absolute offsets relative to `buf`.
+///
+/// Every entry is validated before anything else uses it: the dtype is known, the shape's byte
+/// size passes [`crate::dtype::checked_nbytes`] and equals `end - start`, `[start, end)` lies inside
+/// the data section, and no two entries overlap.
 pub fn parse_header(buf: &[u8]) -> Result<StHeader> {
     if buf.len() < 8 {
         bail!("file too small for safetensors");
@@ -80,7 +85,9 @@ pub fn parse_header(buf: &[u8]) -> Result<StHeader> {
                 "tensor {k}: data_offsets [{s},{e}] out of bounds (data section {data_len} bytes)"
             );
         }
-        if e - s != numel(&shape) * dtype.size() as u64 {
+        let nbytes =
+            crate::dtype::checked_nbytes(&shape, dtype).with_context(|| format!("tensor {k}"))?;
+        if e - s != nbytes {
             bail!(
                 "tensor {k}: byte length {} does not match shape {:?} x {}",
                 e - s,
@@ -96,7 +103,16 @@ pub fn parse_header(buf: &[u8]) -> Result<StHeader> {
             end: base + e,
         });
     }
-    out.entries.sort_by_key(|e| e.start);
+    out.entries.sort_by_key(|e| (e.start, e.end));
+    for w in out.entries.windows(2) {
+        if w[0].end > w[1].start {
+            bail!(
+                "tensors {} and {} overlap in the data section",
+                w[0].name,
+                w[1].name
+            );
+        }
+    }
     Ok(out)
 }
 

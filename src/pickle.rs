@@ -12,10 +12,17 @@
 //! * Extension registry opcodes (EXT1/2/4) and out-of-band buffers are refused.
 //! * All containers live in a flat arena addressed by index, so self-referencing or
 //!   deeply nested pickles cannot cause recursive drops; all consumers that walk the
-//!   graph use explicit depth limits.
+//!   graph use explicit depth limits and visit budgets (a DAG of shared references can
+//!   otherwise describe an exponentially large tree).
+//! * Resource limits: the VM stack, the MARK stack, the memo and the node arena are capped
+//!   ([`MAX_STACK`], [`MAX_MARKS`], [`MAX_MEMO`], [`MAX_NODES`]), and the total number of values
+//!   copied out of existing containers (`REDUCE` args, `set(...)`, `OrderedDict(...)`,
+//!   `_codecs.encode`) is limited to a small multiple of the pickle size, so a memo reference to a
+//!   big list cannot be used to allocate quadratic memory (a "memo bomb").
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -52,6 +59,8 @@ pub enum Node {
 pub struct Pickle {
     pub nodes: Vec<Node>,
     pub root: Value,
+    /// Node visits left for [`Pickle::to_json`], shared by all calls on this pickle.
+    json_budget: Cell<u64>,
 }
 
 /// Which globals a pickle may reference. Each format gets the smallest list that its real
@@ -172,9 +181,20 @@ struct Vm<'a> {
     memo: HashMap<u32, Value>,
     nodes: Vec<Node>,
     allow: Allow,
+    /// values that may still be copied out of existing containers (see the module docs)
+    copy_budget: usize,
 }
 
-const MAX_NODES: usize = 50_000_000;
+/// Most container/object nodes one pickle may create.
+pub const MAX_NODES: usize = 50_000_000;
+/// Most values on the VM stack at once.
+pub const MAX_STACK: usize = 16 << 20;
+/// Most open MARKs (nesting depth of `(`).
+pub const MAX_MARKS: usize = 1 << 16;
+/// Most memo entries.
+pub const MAX_MEMO: usize = MAX_NODES;
+/// Total node visits of all [`Pickle::to_json`] calls on one pickle.
+const JSON_BUDGET: u64 = 1_000_000;
 
 pub fn load(data: &[u8], allow: Allow) -> Result<Pickle> {
     let mut vm = Vm {
@@ -185,6 +205,7 @@ pub fn load(data: &[u8], allow: Allow) -> Result<Pickle> {
         memo: HashMap::new(),
         nodes: Vec::new(),
         allow,
+        copy_budget: data.len().saturating_mul(4).saturating_add(1 << 20),
     };
     let root = vm
         .run()
@@ -192,17 +213,35 @@ pub fn load(data: &[u8], allow: Allow) -> Result<Pickle> {
     Ok(Pickle {
         nodes: vm.nodes,
         root,
+        json_budget: Cell::new(JSON_BUDGET),
     })
 }
 
 impl<'a> Vm<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.data.len() {
-            bail!("truncated pickle");
-        }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.data.len())
+            .ok_or_else(|| anyhow!("truncated pickle"))?;
+        let s = &self.data[self.pos..end];
+        self.pos = end;
         Ok(s)
+    }
+    fn push(&mut self, v: Value) -> Result<()> {
+        if self.stack.len() >= MAX_STACK {
+            bail!("pickle stack too deep (limit {MAX_STACK} values)");
+        }
+        self.stack.push(v);
+        Ok(())
+    }
+    fn charge_copy(&mut self, n: usize) -> Result<()> {
+        self.copy_budget = self.copy_budget.checked_sub(n).ok_or_else(|| {
+            anyhow!(
+                "pickle copies too many values out of existing containers (memo-reference abuse?)"
+            )
+        })?;
+        Ok(())
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -270,13 +309,21 @@ impl<'a> Vm<'a> {
         }
         None
     }
-    fn seq_items(&self, v: &Value) -> Result<Vec<Value>> {
-        match v {
+    fn seq_items(&mut self, v: &Value) -> Result<Vec<Value>> {
+        let n = match v {
             Value::Ref(i) => match &self.nodes[*i] {
-                Node::Tuple(x) | Node::List(x) | Node::Set(x) => Ok(x.clone()),
+                Node::Tuple(x) | Node::List(x) | Node::Set(x) => x.len(),
                 _ => bail!("expected tuple/list"),
             },
             _ => bail!("expected tuple/list"),
+        };
+        self.charge_copy(n)?;
+        match v {
+            Value::Ref(i) => match &self.nodes[*i] {
+                Node::Tuple(x) | Node::List(x) | Node::Set(x) => Ok(x.clone()),
+                _ => unreachable!("checked above"),
+            },
+            _ => unreachable!("checked above"),
         }
     }
     fn call(&mut self, func: Value, args: Vec<Value>) -> Result<Value> {
@@ -306,6 +353,8 @@ impl<'a> Vm<'a> {
             ("_codecs", "encode") => match args.first() {
                 Some(Value::Str(s)) => {
                     // protocol-2 bytes: _codecs.encode(<latin1 str>, 'latin1')
+                    let s = s.clone();
+                    self.charge_copy(s.len())?;
                     let b: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
                     Ok(Value::Bytes(b.into()))
                 }
@@ -389,7 +438,12 @@ impl<'a> Vm<'a> {
                         .pop()
                         .ok_or_else(|| anyhow!("empty stack at STOP"));
                 }
-                b'(' => self.marks.push(self.stack.len()),
+                b'(' => {
+                    if self.marks.len() >= MAX_MARKS {
+                        bail!("pickle MARKs nested too deeply (limit {MAX_MARKS})");
+                    }
+                    self.marks.push(self.stack.len())
+                }
                 b'0' => {
                     self.pop()?;
                 }
@@ -398,22 +452,22 @@ impl<'a> Vm<'a> {
                 }
                 b'2' => {
                     let t = self.top()?.clone();
-                    self.stack.push(t)
+                    self.push(t)?
                 }
-                b'N' => self.stack.push(Value::None),
-                0x88 => self.stack.push(Value::Bool(true)),
-                0x89 => self.stack.push(Value::Bool(false)),
+                b'N' => self.push(Value::None)?,
+                0x88 => self.push(Value::Bool(true))?,
+                0x89 => self.push(Value::Bool(false))?,
                 b'J' => {
                     let v = self.u32()? as i32 as i64;
-                    self.stack.push(Value::Int(v))
+                    self.push(Value::Int(v))?
                 }
                 b'K' => {
                     let v = self.u8()? as i64;
-                    self.stack.push(Value::Int(v))
+                    self.push(Value::Int(v))?
                 }
                 b'M' => {
                     let v = self.u16()? as i64;
-                    self.stack.push(Value::Int(v))
+                    self.push(Value::Int(v))?
                 }
                 0x8a | 0x8b => {
                     let n = if op == 0x8a {
@@ -432,7 +486,7 @@ impl<'a> Vm<'a> {
                         [0u8; 8]
                     };
                     buf[..n].copy_from_slice(b);
-                    self.stack.push(Value::Int(i64::from_le_bytes(buf)))
+                    self.push(Value::Int(i64::from_le_bytes(buf)))?
                 }
                 b'I' => {
                     let l = self.line()?;
@@ -441,19 +495,19 @@ impl<'a> Vm<'a> {
                         "01" => Value::Bool(true),
                         _ => Value::Int(l.trim().parse()?),
                     };
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'L' => {
                     let l = self.line()?.trim_end_matches('L');
-                    self.stack.push(Value::Int(l.parse()?))
+                    self.push(Value::Int(l.parse()?))?
                 }
                 b'F' => {
                     let l = self.line()?;
-                    self.stack.push(Value::Float(l.trim().parse()?))
+                    self.push(Value::Float(l.trim().parse()?))?
                 }
                 b'G' => {
                     let v = f64::from_be_bytes(self.take(8)?.try_into().unwrap());
-                    self.stack.push(Value::Float(v))
+                    self.push(Value::Float(v))?
                 }
                 0x8c | b'X' | 0x8d => {
                     let n = match op {
@@ -463,16 +517,16 @@ impl<'a> Vm<'a> {
                     };
                     let n = self.len_checked(n)?;
                     let s = std::str::from_utf8(self.take(n)?)?;
-                    self.stack.push(Value::Str(s.into()))
+                    self.push(Value::Str(s.into()))?
                 }
                 b'V' => {
                     let s = self.line()?;
-                    self.stack.push(Value::Str(s.into()))
+                    self.push(Value::Str(s.into()))?
                 }
                 b'S' => {
                     let s = self.line()?.trim();
                     let s = s.trim_matches(|c| c == '\'' || c == '"');
-                    self.stack.push(Value::Str(s.into()))
+                    self.push(Value::Str(s.into()))?
                 }
                 b'T' | b'U' => {
                     let n = if op == b'U' {
@@ -484,7 +538,7 @@ impl<'a> Vm<'a> {
                     let b = self.take(n)?;
                     // py2 str: decode as latin1
                     let s: String = b.iter().map(|&c| c as char).collect();
-                    self.stack.push(Value::Str(s.into()))
+                    self.push(Value::Str(s.into()))?
                 }
                 b'C' | b'B' | 0x8e | 0x96 => {
                     let n = match op {
@@ -494,11 +548,11 @@ impl<'a> Vm<'a> {
                     };
                     let n = self.len_checked(n)?;
                     let b = self.take(n)?;
-                    self.stack.push(Value::Bytes(b.into()))
+                    self.push(Value::Bytes(b.into()))?
                 }
                 b')' => {
                     let v = self.push_node(Node::Tuple(vec![]))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x85..=0x87 => {
                     let k = (op - 0x84) as usize;
@@ -508,40 +562,40 @@ impl<'a> Vm<'a> {
                     }
                     items.reverse();
                     let v = self.push_node(Node::Tuple(items))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b't' => {
                     let items = self.pop_mark()?;
                     let v = self.push_node(Node::Tuple(items))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b']' => {
                     let v = self.push_node(Node::List(vec![]))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'l' => {
                     let items = self.pop_mark()?;
                     let v = self.push_node(Node::List(items))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'}' => {
                     let v = self.push_node(Node::Dict(vec![]))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'd' => {
                     let items = self.pop_mark()?;
                     let v = self.push_node(Node::Dict(vec![]))?;
                     self.setitems(&v, items)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x8f => {
                     let v = self.push_node(Node::Set(vec![]))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x91 => {
                     let items = self.pop_mark()?;
                     let v = self.push_node(Node::Set(items))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'a' => {
                     let v = self.pop()?;
@@ -565,6 +619,9 @@ impl<'a> Vm<'a> {
                     self.setitems(&t, items)?;
                 }
                 0x94 => {
+                    if self.memo.len() >= MAX_MEMO {
+                        bail!("pickle memo too large (limit {MAX_MEMO} entries)");
+                    }
                     let t = self.top()?.clone();
                     let idx = self.memo.len() as u32;
                     self.memo.insert(idx, t);
@@ -575,6 +632,9 @@ impl<'a> Vm<'a> {
                         b'r' => self.u32()?,
                         _ => self.line()?.trim().parse()?,
                     };
+                    if self.memo.len() >= MAX_MEMO && !self.memo.contains_key(&idx) {
+                        bail!("pickle memo too large (limit {MAX_MEMO} entries)");
+                    }
                     let t = self.top()?.clone();
                     self.memo.insert(idx, t);
                 }
@@ -589,13 +649,13 @@ impl<'a> Vm<'a> {
                         .get(&idx)
                         .cloned()
                         .ok_or_else(|| anyhow!("memo key {idx} missing"))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'c' => {
                     let m = self.line()?.to_string();
                     let n = self.line()?.to_string();
                     let v = self.global(&m, &n)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x93 => {
                     let n = self.pop()?;
@@ -604,21 +664,21 @@ impl<'a> Vm<'a> {
                         bail!("STACK_GLOBAL needs strings")
                     };
                     let v = self.global(&m, &n)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'R' => {
                     let args = self.pop()?;
                     let func = self.pop()?;
                     let args = self.seq_items(&args)?;
                     let v = self.call(func, args)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x81 => {
                     let args = self.pop()?;
                     let cls = self.pop()?;
                     let args = self.seq_items(&args)?;
                     let v = self.call(cls, args)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x92 => {
                     let _kwargs = self.pop()?;
@@ -626,7 +686,7 @@ impl<'a> Vm<'a> {
                     let cls = self.pop()?;
                     let args = self.seq_items(&args)?;
                     let v = self.call(cls, args)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'i' => {
                     let m = self.line()?.to_string();
@@ -634,7 +694,7 @@ impl<'a> Vm<'a> {
                     let args = self.pop_mark()?;
                     let cls = self.global(&m, &n)?;
                     let v = self.call(cls, args)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'o' => {
                     let mut items = self.pop_mark()?;
@@ -643,7 +703,7 @@ impl<'a> Vm<'a> {
                     }
                     let cls = items.remove(0);
                     let v = self.call(cls, items)?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'b' => {
                     let state = self.pop()?;
@@ -660,12 +720,12 @@ impl<'a> Vm<'a> {
                 b'Q' => {
                     let pid = self.pop()?;
                     let v = self.push_node(Node::Persistent(pid))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 b'P' => {
                     let s = self.line()?;
                     let v = self.push_node(Node::Persistent(Value::Str(s.into())))?;
-                    self.stack.push(v)
+                    self.push(v)?
                 }
                 0x82..=0x84 => bail!("pickle extension registry opcodes are not allowed"),
                 0x97 | 0x98 => bail!("out-of-band pickle buffers are not allowed"),
@@ -777,6 +837,11 @@ impl Pickle {
         if depth > 32 {
             return json!("<too deep>");
         }
+        let left = self.json_budget.get();
+        if left == 0 {
+            return json!("<truncated>");
+        }
+        self.json_budget.set(left - 1);
         match v {
             Value::None => serde_json::Value::Null,
             Value::Bool(b) => json!(b),

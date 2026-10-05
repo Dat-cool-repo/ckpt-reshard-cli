@@ -14,7 +14,7 @@
 //! Everything pickled is decoded by the restricted, non-executing reader in `pickle.rs`.
 
 use crate::dtype::{DType, numel};
-use crate::pickle::{self, Allow, Node, Pickle, Value};
+use crate::pickle::{self, Allow, Pickle, Value};
 use crate::zipread;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
@@ -84,6 +84,12 @@ pub fn parse_metadata(bytes: &[u8]) -> Result<DcpMeta> {
             .as_str(k)
             .ok_or_else(|| anyhow!("non-string fqn"))?
             .to_string();
+        if fqn.len() > crate::torchsave::MAX_PATH {
+            bail!(
+                "tensor name longer than {} bytes in .metadata",
+                crate::torchsave::MAX_PATH
+            );
+        }
         match pk.class_of(v) {
             Some((_, "BytesStorageMetadata")) => out.bytes_items.push(fqn),
             Some((_, "TensorStorageMetadata")) => out.tensors.push(parse_tensor_meta(&pk, fqn, v)?),
@@ -122,6 +128,9 @@ pub fn parse_metadata(bytes: &[u8]) -> Result<DcpMeta> {
                 .field(v, "length")
                 .and_then(|x| pk.as_int(x))
                 .ok_or_else(|| anyhow!("{fqn}: no length"))?;
+            if offset < 0 || length < 0 || offset.checked_add(length).is_none() {
+                bail!("{fqn}: invalid storage range offset={offset} length={length}");
+            }
             let transforms = match pk.field(v, "transform_descriptors") {
                 None | Some(Value::None) => vec![],
                 Some(t) => pk
@@ -175,6 +184,7 @@ fn parse_tensor_meta(pk: &Pickle, fqn: String, v: &Value) -> Result<DcpTensorMet
         )
         .ok_or_else(|| anyhow!("{fqn}: bad size"))?,
     )?;
+    crate::dtype::checked_nbytes(&size, dtype).with_context(|| fqn.clone())?;
     let mut chunks = Vec::new();
     let cl = pk
         .field(v, "chunks")
@@ -195,7 +205,7 @@ fn parse_tensor_meta(pk: &Pickle, fqn: String, v: &Value) -> Result<DcpTensorMet
             bail!("{fqn}: chunk rank mismatch");
         }
         for d in 0..size.len() {
-            if offsets[d] + sizes[d] > size[d] {
+            if offsets[d].checked_add(sizes[d]).is_none_or(|e| e > size[d]) {
                 bail!(
                     "{fqn}: chunk {:?}+{:?} out of bounds of {:?}",
                     offsets,
@@ -227,10 +237,10 @@ impl<'a> ChunkView<'a> {
     pub fn is_contiguous(&self) -> bool {
         let mut expect = 1u64;
         for d in (0..self.sizes.len()).rev() {
-            if self.sizes[d] != 1 && self.strides[d] != expect {
+            if self.sizes[d] != 1 && self.strides.get(d) != Some(&expect) {
                 return false;
             }
-            expect *= self.sizes[d];
+            expect = expect.saturating_mul(self.sizes[d]);
         }
         true
     }
@@ -240,9 +250,10 @@ impl<'a> ChunkView<'a> {
             return None;
         }
         let es = self.dtype.size() as u64;
-        let s = self.storage_offset * es;
-        let e = s + numel(&self.sizes) * es;
-        self.storage.get(s as usize..e as usize)
+        let s = self.storage_offset.checked_mul(es)?;
+        let e = s.checked_add(numel(&self.sizes).checked_mul(es)?)?;
+        self.storage
+            .get(usize::try_from(s).ok()?..usize::try_from(e).ok()?)
     }
 }
 
@@ -254,14 +265,15 @@ pub fn read_chunk<'a>(file: &'a [u8], si: &StorageInfo, fqn: &str) -> Result<Chu
             si.transforms
         );
     }
-    let start = si.offset as usize;
-    if start > file.len() {
-        bail!("{fqn}: offset beyond end of {}", si.relative_path);
-    }
+    let start = usize::try_from(si.offset)
+        .ok()
+        .filter(|&s| s <= file.len())
+        .ok_or_else(|| anyhow!("{fqn}: offset beyond end of {}", si.relative_path))?;
     let rest = &file[start..];
     if zipread::is_zip(rest) {
-        let end = start
-            .checked_add(si.length as usize)
+        let end = usize::try_from(si.length)
+            .ok()
+            .and_then(|l| start.checked_add(l))
             .filter(|&e| e <= file.len())
             .ok_or_else(|| anyhow!("{fqn}: chunk out of bounds"))?;
         return read_torch_save_tensor(&file[start..end])
@@ -275,112 +287,33 @@ pub fn read_chunk<'a>(file: &'a [u8], si: &StorageInfo, fqn: &str) -> Result<Chu
         .iter()
         .find(|e| e.name == fqn)
         .ok_or_else(|| anyhow!("{fqn}: not found in safetensors chunk file"))?;
-    let n = e.shape.len();
-    let mut strides = vec![1u64; n];
-    for d in (0..n.saturating_sub(1)).rev() {
-        strides[d] = strides[d + 1] * e.shape[d + 1];
-    }
-    Ok(ChunkView {
-        storage: &rest[e.start as usize..e.end as usize],
-        storage_offset: 0,
-        sizes: e.shape.clone(),
-        strides,
-        dtype: e.dtype,
-    })
+    let v =
+        crate::ckpt::contiguous_view(&rest[e.start as usize..e.end as usize], &e.shape, e.dtype);
+    Ok(v)
 }
 
 /// Decode a `torch.save` archive holding a single tensor.
 pub fn read_torch_save_tensor(zip: &[u8]) -> Result<ChunkView<'_>> {
-    let entries = zipread::entries(zip)?;
-    let pkl = entries
-        .iter()
-        .find(|e| e.name.ends_with("/data.pkl") || e.name == "data.pkl")
-        .ok_or_else(|| anyhow!("no data.pkl"))?;
-    let prefix = &pkl.name[..pkl.name.len() - "data.pkl".len()];
-    let pk = pickle::load(pkl.checked_data()?, Allow::Checkpoint)?;
-    let mut root = pk.root.clone();
-    if let Some(("torch._utils", "_rebuild_parameter")) = pk.class_of(&root) {
-        root = pk
-            .obj_args(&root)
-            .and_then(|a| a.first().cloned())
-            .ok_or_else(|| anyhow!("bad _rebuild_parameter"))?;
+    let ts = crate::torchsave::TorchSave::open(zip, Allow::Checkpoint)?;
+    let root = ts.pickle.root.clone();
+    let t = ts.tensor_at(&root, "chunk")?.ok_or_else(|| {
+        anyhow!(
+            "expected a tensor record, found {:?}",
+            ts.pickle.class_of(&root)
+        )
+    })?;
+    if crate::zipread::verify_enabled() {
+        ts.verify_storage(zip, &t.storage_key)?;
     }
-    match pk.class_of(&root) {
-        Some(("torch._utils", "_rebuild_tensor_v2" | "_rebuild_tensor")) => {}
-        other => bail!("expected a tensor record, found {:?}", other),
-    }
-    let args = pk
-        .obj_args(&root)
-        .ok_or_else(|| anyhow!("bad tensor record"))?;
-    if args.len() < 4 {
-        bail!("bad _rebuild_tensor args");
-    }
-    let Some(Node::Persistent(pid)) = pk.node(&args[0]) else {
-        bail!("tensor storage is not a persistent id")
-    };
-    let pid = pk.seq(pid).ok_or_else(|| anyhow!("bad persistent id"))?;
-    if pid.len() < 5 || pk.as_str(&pid[0]) != Some("storage") {
-        bail!("unsupported persistent id");
-    }
-    let dtype = match pk.class_of(&pid[1]) {
-        Some(("torch", n)) => DType::from_storage_name(n)
-            .or_else(|| DType::from_torch_name(n))
-            .ok_or_else(|| anyhow!("unsupported storage type torch.{n}"))?,
-        other => bail!("unexpected storage type {:?}", other),
-    };
-    let key = pk
-        .as_str(&pid[2])
-        .ok_or_else(|| anyhow!("bad storage key"))?;
-    let storage_numel = pk
-        .as_int(&pid[4])
-        .ok_or_else(|| anyhow!("bad storage numel"))? as u64;
-    let data_name = format!("{prefix}data/{key}");
-    let data = entries
-        .iter()
-        .find(|e| e.name == data_name)
-        .ok_or_else(|| anyhow!("missing {data_name}"))?
-        .checked_data()?;
-    if (data.len() as u64) < storage_numel * dtype.size() as u64 {
-        bail!("storage {key} truncated");
-    }
-    let storage_offset = pk
-        .as_int(&args[1])
-        .ok_or_else(|| anyhow!("bad storage offset"))? as u64;
-    let sizes = to_u64s(pk.int_list(&args[2]).ok_or_else(|| anyhow!("bad sizes"))?)?;
-    let strides = to_u64s(
-        pk.int_list(&args[3])
-            .ok_or_else(|| anyhow!("bad strides"))?,
-    )?;
-    if sizes.len() != strides.len() {
-        bail!("sizes/strides rank mismatch");
-    }
-    // bounds check: max linear index must be inside storage
-    if numel(&sizes) > 0 {
-        let max_idx: u64 = storage_offset
-            + sizes
-                .iter()
-                .zip(&strides)
-                .map(|(s, st)| (s - 1) * st)
-                .sum::<u64>();
-        if max_idx >= storage_numel {
-            bail!("tensor view exceeds its storage");
-        }
-    }
-    Ok(ChunkView {
-        storage: &data[..(storage_numel as usize) * dtype.size()],
-        storage_offset,
-        sizes,
-        strides,
-        dtype,
-    })
+    Ok(t.view(zip))
 }
 
 /// Decode a non-tensor (BytesStorageMetadata) item into JSON for display.
 pub fn read_bytes_item(file: &[u8], si: &StorageInfo, allow: Allow) -> Result<serde_json::Value> {
-    let s = si.offset as usize;
-    let e = s + si.length as usize;
-    let b = file
-        .get(s..e)
+    let b = usize::try_from(si.offset)
+        .ok()
+        .zip(usize::try_from(si.length).ok())
+        .and_then(|(s, l)| file.get(s..s.checked_add(l)?))
         .ok_or_else(|| anyhow!("bytes item out of bounds"))?;
     if !zipread::is_zip(b) {
         return Ok(serde_json::json!(format!("<{} raw bytes>", b.len())));

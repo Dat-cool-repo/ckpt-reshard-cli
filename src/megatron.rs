@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 
 // ------------------------------------------------------------------ detection
 
+/// Most transformer layers accepted (stacked `torch_dist` tensors, PP layer offsets). Real models
+/// have a few hundred at most; the bound stops a hostile shape from creating billions of entries.
+pub const MAX_LAYERS: u64 = 1 << 16;
+
 pub fn is_torch_dist(dir: &Path) -> bool {
     std::fs::read(dir.join("metadata.json"))
         .ok()
@@ -136,7 +140,7 @@ impl MArgs {
     pub fn head_dim(&self) -> Result<u64> {
         match self.u("kv_channels") {
             Some(k) => Ok(k),
-            None => Ok(self.hidden()? / self.heads()?),
+            None => Ok(self.hidden()? / self.heads()?.max(1)),
         }
     }
     pub fn swiglu(&self) -> bool {
@@ -354,7 +358,15 @@ pub fn open_legacy(dir: &Path, o: &OpenOpts) -> Result<Checkpoint> {
             .iter()
             .filter_map(|t| split_layer(&t.path).map(|x| x.1))
             .collect();
-        offsets[p] = offsets[p - 1] + prev.iter().max().map_or(0, |m| m + 1);
+        let local = match prev.iter().max() {
+            Some(&m) if m < MAX_LAYERS => m + 1,
+            Some(&m) => bail!(
+                "pipeline stage {} has layer index {m}; at most {MAX_LAYERS} layers are supported",
+                p - 1
+            ),
+            None => 0,
+        };
+        offsets[p] = offsets[p - 1] + local;
     }
     // global name -> per TP rank tensor (first PP stage holding it wins, e.g. tied embeddings)
     let mut order: Vec<String> = Vec::new();
@@ -365,7 +377,7 @@ pub fn open_legacy(dir: &Path, o: &OpenOpts) -> Result<Checkpoint> {
             let file = rank[&(t, p)].0;
             for ten in &per_rank[&(t, p)] {
                 let g = match split_layer(&ten.path) {
-                    Some((pre, i, rest)) => format!("{pre}{}{rest}", i + offsets[p]),
+                    Some((pre, i, rest)) => format!("{pre}{}{rest}", i.saturating_add(offsets[p])),
                     None => ten.path.clone(),
                 };
                 let slot = by_name.entry(g.clone()).or_insert_with(|| {
@@ -418,7 +430,9 @@ pub fn open_legacy(dir: &Path, o: &OpenOpts) -> Result<Checkpoint> {
                     bail!("{name}: uneven TP shards are not supported");
                 }
                 let per = t0.sizes[dim];
-                shape[dim] = per * tp as u64;
+                shape[dim] = per
+                    .checked_mul(tp as u64)
+                    .ok_or_else(|| anyhow!("{name}: merged shape overflows"))?;
                 for (r, (file, s)) in shards.iter().enumerate() {
                     let base = ViewPart::from_ts(*file, s, Place::Block(vec![0; n]));
                     if rule == Rule::Gated {
@@ -475,9 +489,10 @@ pub fn from_torch_dist(mut ck: Checkpoint, o: &OpenOpts) -> Result<Checkpoint> {
         .find(|b| b.name == "common_state" || b.name.starts_with("common_state/"))
     {
         let f = &ck.files[b.file].map;
-        let s = b.info.offset as usize;
-        let blob = f
-            .get(s..s + b.info.length as usize)
+        let blob = usize::try_from(b.info.offset)
+            .ok()
+            .zip(usize::try_from(b.info.length).ok())
+            .and_then(|(s, l)| f.get(s..s.checked_add(l)?))
             .ok_or_else(|| anyhow!("common_state out of bounds"))?;
         let ts = TorchSave::open(blob, Allow::Megatron).context("decoding common_state")?;
         args = args_from(&ts);
@@ -501,6 +516,13 @@ pub fn from_torch_dist(mut ck: Checkpoint, o: &OpenOpts) -> Result<Checkpoint> {
             && !t.shape.is_empty()
             && nl.is_none_or(|l| t.shape[0] == l);
         if stacked {
+            if t.shape[0] > MAX_LAYERS {
+                bail!(
+                    "{}: {} stacked layers; at most {MAX_LAYERS} are supported",
+                    t.name,
+                    t.shape[0]
+                );
+            }
             let pos = t.name.find("decoder.layers.").unwrap() + "decoder.layers.".len();
             for l in 0..t.shape[0] {
                 let mut start = vec![0; t.shape.len()];
@@ -592,7 +614,7 @@ fn finish(mut ck: Checkpoint, args: MArgs, o: &OpenOpts, derived: bool) -> Resul
                 .tensors
                 .iter()
                 .find(|t| is_vocab(&t.name))
-                .map(|t| t.shape[0]);
+                .and_then(|t| t.shape.first().copied());
             if let Some(v) = v {
                 eprintln!(
                     "warning: vocab size unknown (no args.vocab_size); keeping the padded vocab of {v} rows. Pass --vocab-size to unpad."
@@ -612,6 +634,12 @@ fn is_vocab(name: &str) -> bool {
 
 /// Restrict a Derived tensor to its first `v` rows (vocab unpadding).
 fn unpad(t: &mut TensorInfo, v: u64) -> Result<()> {
+    if t.shape.is_empty() {
+        bail!(
+            "{}: a vocab tensor must have at least one dimension",
+            t.name
+        );
+    }
     if t.shape[0] < v {
         bail!(
             "{}: --vocab-size {v} exceeds the {} stored rows",
@@ -622,6 +650,9 @@ fn unpad(t: &mut TensorInfo, v: u64) -> Result<()> {
     let Loc::Derived { pieces } = &mut t.loc else {
         bail!("internal: unpad on non-derived tensor")
     };
+    if pieces.len() != 1 || pieces[0].size.len() < t.shape.len() {
+        bail!("internal: unpad of a composite tensor {}", t.name);
+    }
     let drop = pieces[0].size.len() - t.shape.len();
     pieces[0].size[drop] = v;
     t.shape[0] = v;
@@ -714,10 +745,25 @@ fn hf_map(
     let ng = args.groups()?;
     let hd = args.head_dim()?;
     let hidden = args.hidden()?;
+    if nh == 0 || ng == 0 || hd == 0 {
+        bail!(
+            "invalid Megatron args: num_attention_heads={nh}, num_query_groups={ng}, head_dim={hd}"
+        );
+    }
     if nh % ng != 0 {
         bail!("num_attention_heads {nh} not divisible by num_query_groups {ng}");
     }
     let qpg = nh / ng;
+    // every row count derived from the args below must fit comfortably in u64
+    let big = |x: Option<u64>| x.is_none_or(|v| v > 1 << 40);
+    if big(qpg
+        .checked_add(2)
+        .and_then(|x| x.checked_mul(hd))
+        .and_then(|x| x.checked_mul(ng)))
+        || big(nh.checked_mul(hd))
+    {
+        bail!("invalid Megatron args: heads x head_dim is absurdly large");
+    }
     let qkv_bias = args.b("add_qkv_bias") || args.b("add_bias_linear");
     let lin_bias = args.b("add_bias_linear");
     let arch = match arch {
@@ -745,18 +791,21 @@ fn hf_map(
             let Loc::Derived { pieces } = &src.loc else {
                 bail!("internal: expected derived source")
             };
+            if shape.is_empty() || src.shape.is_empty() {
+                bail!("{}: a 0-d tensor cannot be mapped to HF", src.name);
+            }
             let p0 = &pieces[0];
             let drop = p0.size.len() - src.shape.len();
             let mut new = Vec::new();
-            let mut at = 0;
+            let mut at = 0u64;
             for (s, l) in dim0 {
                 let mut start = p0.start.clone();
                 let mut size = p0.size.clone();
-                start[drop] += s;
+                start[drop] = start[drop].saturating_add(s);
                 size[drop] = l;
                 let mut off = vec![0; shape.len()];
                 off[0] = at;
-                at += l;
+                at = at.saturating_add(l);
                 new.push(Piece {
                     base: p0.base,
                     start,
@@ -785,7 +834,10 @@ fn hf_map(
             continue;
         }
         dtype.get_or_insert(t.dtype);
-        let rows = t.shape.first().copied().unwrap_or(0);
+        if t.shape.is_empty() {
+            bail!("{}: a 0-d tensor cannot be mapped to HF", t.name);
+        }
+        let rows = t.shape[0];
         let full = |t: &TensorInfo| vec![(0, t.shape[0])];
         match c.as_str() {
             "embedding.word_embeddings.weight" | "output_layer.weight" => {
@@ -798,6 +850,13 @@ fn hf_map(
                 } else {
                     "lm_head.weight"
                 };
+                if t.shape.len() != 2 {
+                    bail!(
+                        "{}: expected a 2-d embedding, got shape {:?}",
+                        t.name,
+                        t.shape
+                    );
+                }
                 emit(n.into(), t, vec![(0, v)], vec![v, t.shape[1]])?;
                 continue;
             }
@@ -926,7 +985,7 @@ fn hf_map(
         "architectures": [if arch == "qwen2" { "Qwen2ForCausalLM" } else { "LlamaForCausalLM" }],
         "model_type": arch,
         "hidden_size": hidden,
-        "intermediate_size": ffn.unwrap_or(4 * hidden),
+        "intermediate_size": ffn.unwrap_or(hidden.saturating_mul(4)),
         "num_hidden_layers": args.num_layers(),
         "num_attention_heads": nh,
         "num_key_value_heads": ng,

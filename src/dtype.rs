@@ -227,8 +227,45 @@ fn f8_e4m3fn_to_f64(v: u8) -> f64 {
     }
 }
 
+/// Number of elements of `shape`. Saturates instead of overflowing; shapes read from files are
+/// validated with [`checked_nbytes`] first, so saturation only matters for hostile input that is
+/// rejected anyway.
 pub fn numel(shape: &[u64]) -> u64 {
-    shape.iter().product()
+    shape.iter().fold(1u64, |a, &d| a.saturating_mul(d))
+}
+
+/// Most dimensions a tensor read from a file may have (torch allows 64).
+pub const MAX_RANK: usize = 64;
+
+/// Largest tensor (in bytes) accepted from any file: 2^56 bytes (64 PiB). Real tensors are many
+/// orders of magnitude smaller; the bound keeps every byte offset computed from a shape far away
+/// from `u64`/`usize` overflow.
+pub const MAX_TENSOR_BYTES: u64 = 1 << 56;
+
+/// Byte size of a tensor of `shape` and `dtype`, validated for use as an allocation size: the rank is
+/// at most [`MAX_RANK`] and the product of the *non-zero* dims times the element size is at most
+/// [`MAX_TENSOR_BYTES`]. Checking the non-zero dims also bounds every row-major stride derived from
+/// the shape, even when another dim is 0 (`[0, 2^40, 2^40]` is refused).
+pub fn checked_nbytes(shape: &[u64], dtype: DType) -> Result<u64> {
+    if shape.len() > MAX_RANK {
+        bail!(
+            "tensor rank {} exceeds the maximum of {MAX_RANK}",
+            shape.len()
+        );
+    }
+    let mut nz = dtype.size() as u64;
+    let mut zero = false;
+    for &d in shape {
+        if d == 0 {
+            zero = true;
+            continue;
+        }
+        nz = match nz.checked_mul(d) {
+            Some(v) if v <= MAX_TENSOR_BYTES => v,
+            _ => bail!("tensor shape {shape:?} x {dtype} is absurdly large (over 2^56 bytes)"),
+        };
+    }
+    Ok(if zero { 0 } else { nz })
 }
 
 /// Parse sizes like "5GB", "500MB", "300KiB", "1024".
