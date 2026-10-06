@@ -78,6 +78,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "half",
+ "libc",
  "memmap2",
  "rayon",
  "serde",
