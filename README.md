@@ -15,8 +15,10 @@ plain `torch.save` files. It can:
 - split and merge tensor-parallel layouts, including GQA and padded vocabularies;
 - cast between fp32/bf16/fp16/fp8 with results bit-identical to `torch.Tensor.to`.
 
-Tensors are memory-mapped and streamed, so peak memory is about the size of the largest tensor, not
-the size of the model.
+Tensors are memory-mapped and streamed, so `convert`, resharding and TP splitting need about as much
+memory as the largest tensor, not the whole model: converting the 0.94 GiB Qwen2.5-0.5B, whose
+largest tensor is 260 MiB, peaks at 260–300 MiB of RSS on Linux. Merging TP ranks and `diff` hold a few
+tensors at once (see [Testing](#testing)).
 
 ```console
 $ ckpt inspect ./megatron_ckpt --summary
@@ -44,6 +46,7 @@ $ ckpt diff ./step_1000 ./step_2000 --json        # per-tensor max/mean abs diff
   [diff](#diff) · [`--dtype`](#--dtype-casts) · [`--verify`](#--verify-crc32-checks)
 - [Safety model](#safety-model)
 - [Correctness](#correctness)
+- [Testing](#testing)
 - [Benchmarks](#benchmarks)
 - [Limitations](#limitations)
 - [S3 / GCS](#s3--gcs)
@@ -80,11 +83,13 @@ See [docs/MOTIVATION.md](docs/MOTIVATION.md) for the background and a survey of 
 | Megatron-LM legacy (`ckpt_format=torch`), TP and PP | `latest_checkpointed_iteration.txt`, `iter_*/mp_rank_TT[_PPP]/model_optim_rng.pt` | yes | yes¹ | no | yes¹ | yes |
 | Megatron-LM `torch_dist` | `iter_*/.metadata` + `metadata.json` | yes | yes¹ | no | yes¹ | yes |
 | DeepSpeed ZeRO stage 1/2/3 | `latest`, `global_stepN/*_model_states.pt` + `*_optim_states.pt` | yes | yes² | no | yes² | yes |
-| `ckpt` tensor-parallel layout | `tp_rank_XX/` + `tp_plan.json` | yes | yes | yes (`reshard --tp`) | yes (merge / re-split) | yes |
+| `ckpt` tensor-parallel layout | `tp_rank_XX/` + `tp_plan.json` | no³ | no³ | yes (`reshard --tp`) | yes (merge / re-split) | no³ |
 
 ¹ TP/PP-merged and, unless `--keep-names` is given, mapped to HF Llama/Qwen2 names with a generated
 `config.json`. Optimizer state is listed but not merged.
 ² Reconstructed fp32 weights, as DeepSpeed's `zero_to_fp32.py` would produce them.
+³ Only `reshard` reads the TP layout. Merge it first (`ckpt reshard ./tp4 -o merged.safetensors`), or
+inspect a single rank (`ckpt inspect ./tp4/tp_rank_00`).
 
 ## Install
 
@@ -103,8 +108,8 @@ cd ckpt-reshard-cli
 cargo build --release        # -> target/release/ckpt
 ```
 
-You need a recent stable Rust toolchain (the crate uses edition 2024). Nothing else is required at
-runtime: no Python, no CUDA, no torch.
+You need Rust 1.88 or newer (the `rust-version`; builds and tests were checked with 1.88.0). Nothing
+else is required at runtime: no Python, no CUDA, no torch.
 
 ## Usage
 
@@ -127,7 +132,7 @@ ckpt inspect ./megatron_ckpt                    # + TP/PP size, iteration, key M
 ckpt inspect ./megatron_ckpt --hf-arch auto     # as it would look after the HF mapping
 ckpt --raw inspect ./megatron_ckpt/iter_0000010 # torch_dist as stored (stacked layers)
 ckpt inspect ./ds_ckpt                          # + ZeRO stage, world size, param groups, DeepSpeed version
-ckpt inspect ./ds_ckpt/global_step1/mp_rank_00_model_states.pt   # one raw torch.save file
+ckpt --raw inspect ./ds_ckpt/global_step1/mp_rank_00_model_states.pt   # one raw torch.save file
 ```
 
 Non-tensor entries such as optimizer hyperparameters, iteration counters and Megatron `args` are
@@ -300,14 +305,35 @@ pickle stack machine written in Rust:
 - **Refused opcodes.** Extension-registry opcodes and out-of-band buffers are rejected.
 - **No stack exhaustion.** Containers live in a flat arena, so cycles and deep nesting are harmless,
   and graph walkers have depth limits.
-- **Bounds checks.**
+- **Bounds checks, before anything is allocated.**
+  - Every shape, offset and length read from a file is checked with overflow-checked arithmetic.
+    Shapes may have at most 64 dims and 2^56 bytes.
   - Zip, safetensors, DCP and `torch.save` offsets are checked against file sizes.
   - Every tensor view (offset, sizes and strides × dtype) is checked against its storage.
+  - After opening, every tensor's chunks, views and pieces must lie inside the tensor and its
+    files. A tensor may not declare more bytes than the files holding it contain, so a hostile
+    header cannot make `ckpt` allocate more memory than the checkpoint occupies on disk.
   - File names taken from indexes, metadata and tracker files may not escape the checkpoint directory.
+- **Resource limits.**
+  - The pickle VM caps its stack at 16M values, MARK nesting at 65,536, and memo and node arena at
+    50M entries each.
+  - Values copied out of existing containers (`REDUCE` arguments, `set(...)`, `OrderedDict(...)`)
+    may total at most 4× the pickle size plus 1M. That stops memo-reference abuse, where a small
+    pickle rebuilds one big memoised list millions of times.
+  - The state-dict walker visits at most 4× as many nodes as the pickle has, plus 4096, so a DAG of
+    shared references cannot unfold into an exponentially large tree. Tensor names are capped at
+    1024 bytes.
+  - Zip entries must not overlap or repeat a name, and compressed entries are refused, so there is
+    nothing to inflate (no zip bombs). Safetensors headers are capped at 100 MB, as in the reference
+    implementation, and overlapping tensors are refused.
+  - Megatron `torch_dist` checkpoints may stack at most 65,536 layers.
+- **No panics.** Malformed input produces an error and exit code 2. Should a bug still panic, the
+  panic is reported as an internal error with exit code 2.
 
 The test suites build malicious checkpoints with `os.system` payloads in four places: a DCP
 `.metadata`, a pickle inside a DCP chunk, a Megatron rank file and a DeepSpeed optimizer file. All four
-are refused with exit code 2, and the payload never runs. See [tests/README.md](tests/README.md).
+are refused with exit code 2, and the payload never runs. See [tests/README.md](tests/README.md). The
+resource limits are covered by hand-crafted hostile files and by fuzzing; see [Testing](#testing).
 
 ## Correctness
 
@@ -322,7 +348,7 @@ Each path is checked against the reference implementation, on CPU, with torch 2.
 | `--dtype` (all 6 targets) | `torch.Tensor.to` | bit-exact on every bf16/fp16/fp8 value, all midpoints ±1 ulp, specials, 1M random fp32 bit patterns and random f64 |
 | TP split for GQA (tp = 1, 2, 4, 8, with kv replication and vocab padding) | manual torch slicing; per-rank attention summed over ranks vs full attention | identical shards; split → merge bit-exact; tp8 → tp2 equals a fresh tp2 split |
 | Megatron legacy TP2/PP2 merge | megatron-core's own TP=1 gather (`dist_checkpointing.load` into a TP1/PP1 model) | bit-exact |
-| Megatron → HF Qwen2 | logits of the real TP2/PP2 Megatron forward pass vs `Qwen2ForCausalLM.from_pretrained` | max abs diff 2e-7 |
+| Megatron → HF Qwen2 | logits of the real TP2/PP2 Megatron forward pass vs `Qwen2ForCausalLM.from_pretrained` | max abs diff 2.4e-7 (legacy and `torch_dist`) |
 | Megatron `torch_dist` → HF | the legacy conversion | identical files |
 | DeepSpeed ZeRO 1/2/3 (bf16, 3 ranks, uneven partitions, 2 param groups, frozen and tied params) | DeepSpeed `get_fp32_state_dict_from_zero_checkpoint` | bit-exact |
 | ZIP64 DCP chunk > 4 GiB (one 4.19 GiB tensor) | Python `zipfile`, `torch.load(mmap=True)` | structure valid, CRC OK, all 4.5e9 bytes match |
@@ -332,11 +358,175 @@ themselves, on CPU with gloo; see [Development](#development). One deliberate di
 `zero_to_fp32`: buffers keep their stored dtype, whereas `zero_to_fp32` applies `.float()` to them.
 `--dtype fp32` gives the same result.
 
+## Testing
+
+| Suite | What it covers | Where it runs |
+|---|---|---|
+| Unit + CLI tests (`cargo test`) | Every format on the committed tiny fixtures, dtype casts, TP split/merge, CRC checks, and the four malicious-pickle cases | CI: Linux, macOS, Windows |
+| Hostile-input tests ([`tests/hostile.rs`](tests/hostile.rs)) | Hand-crafted hostile files, built at test time (below) | CI: Linux, macOS, Windows |
+| End-to-end pytest ([`tests/`](tests/README.md)) | Real FSDP2/DCP, Megatron-LM and DeepSpeed checkpoints against the frameworks' own loaders | CI: DCP, dtype and TP suites on Linux. Local: Megatron and DeepSpeed |
+| Fuzzing ([`fuzz/`](fuzz)) | 8 libFuzzer targets, one per reader (below) | Local, before releases |
+| Real models | Qwen2.5-0.5B-Instruct from the Hugging Face Hub (below) | Local |
+
+### Hostile inputs
+
+Each of these must exit with code 2 and a clear message, without a panic, within 20 s:
+
+- safetensors with shapes whose product overflows `u64`, or a `0` dim hiding an overflowing
+  stride;
+- a 10^12-element shape backed by 8 bytes, negative or overflowing `data_offsets`, overlapping
+  tensors, 65 dimensions, and a header length of 2^64-1;
+- a DCP `.metadata` declaring 2^62 or 2^30 elements over a 64-byte file, negative or overflowing
+  storage offsets and lengths, and chunk offsets of `i64::MAX`;
+- a DCP chunk record whose view claims 2^40 elements of a 16-element storage;
+- `torch.save` records with negative sizes, overflowing strides, or a storage larger than its zip
+  entry;
+- zip archives with overlapping or duplicate entries, compressed (deflate) entries, a zip64
+  locator at offset 2^64-1, or a central directory past the end of the file;
+- pickles with 100,000 nested MARKs, or a list nested 200,000 deep;
+- memo-reference abuse: `set(memo[0])` repeated 1,000 times over a 100,000-item list, about 10^8
+  copies without the limit;
+- shared-reference DAGs that unfold into 2^60 paths (as values or as dict keys), or into 2^20
+  copies of a tensor record;
+- path traversal in `relative_path` and in HF index shard names.
+
+Every input the fuzzer finds is minimized into `tests/fuzz_regressions/<target>/` and replayed by
+the same test file.
+
+### Fuzzing
+
+`fuzz/` is a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) crate. Every target that opens
+a checkpoint then exercises it the way the CLI would: inspect with chunk grids and decoded
+non-tensor items, `--verify`, read, stream and `read_box` every tensor, cast to bf16, and diff it
+against itself. A global allocator aborts on any single allocation over 256 MiB, so a trusted
+declared size shows up as a crash.
+
+| Target | Input |
+|---|---|
+| `pickle` | raw bytes into the restricted pickle VM (all three allowlists), then the JSON walker |
+| `dcp_metadata` | raw bytes as a DCP `.metadata` |
+| `torch_save` | raw bytes as a `torch.save` zip: zip reader, DCP chunk decoder, and a whole `.pt` state dict |
+| `safetensors` | raw bytes as a safetensors file, and as a safetensors-format DCP chunk |
+| `hf_index` | `model.safetensors.index.json` next to the committed HF shards |
+| `dcp_dir` | one `.metadata` or `.distcp` file of a committed DCP replaced (FSDP2, safetensors chunks, 2-D grid, Megatron `torch_dist` with the HF mapping) |
+| `megatron` | one `model_optim_rng.pt` of the TP2/PP2 fixture replaced (merge, `--vocab-size`, HF mapping) |
+| `deepspeed` | one model/optim states file of the ZeRO-2/ZeRO-3 fixtures replaced |
+
+Before the 0.1 release every target ran for 14–38 minutes of fuzzing (about 2.7 CPU-hours in all,
+≤ 2 h of wall time). The first 2 minutes of each were with AddressSanitizer. The long runs used no
+sanitizer, so the directory targets were 30× faster, but kept debug assertions (overflow checks), the
+allocation guard, an RSS limit of 1–2 GB and `-timeout=10`. Seeds come from the committed
+fixtures (`fuzz/make_seeds.py`).
+
+| Target | Minutes | Executions | Crashes |
+|---|---:|---:|---|
+| `pickle` | 14 | 3.69M | 0 |
+| `dcp_metadata` | 14 | 6.44M | 0 |
+| `torch_save` | 14¹ | 3.38M | 1, fixed (below) |
+| `safetensors` | 14 | 4.98M | 0 |
+| `hf_index` | 14 | 4.35M | 0 |
+| `dcp_dir` | 38 | 263K | 0 |
+| `megatron` | 38 | 895K | 0 |
+| `deepspeed` | 14 | 1.06M | 0 |
+
+¹ Plus an earlier `torch_save` campaign that found the crash; its logs were lost in a VM restart.
+The 14 minutes counted here ran on the fixed code.
+
+The crash was a 7.5 KB pickle whose dict keys were themselves dicts, nested many levels deep. Rendering a
+non-string key as JSON escapes the quotes of the key inside it, so the text doubled at every level and
+one allocation reached 512 MiB. Rendered keys are now capped at 128 characters, and copied strings
+have a byte budget. The input is in `tests/fuzz_regressions/torch_save/`.
+
+The hand-written hostile tests came out of a code review done alongside the fuzzing. Before the fixes, overflowing shapes
+and offsets panicked, and a DCP or `torch.save` header could make `ckpt` allocate whatever size it
+declared. A ZeRO-3 checkpoint whose ranks disagreed on partition sizes could loop forever, and
+memo references and shared-reference DAGs could blow up memory or time.
+
+To run a target (Linux, nightly Rust):
+
+```bash
+cargo install cargo-fuzz
+python3 fuzz/make_seeds.py /tmp/seeds          # seed corpora from tests/fixtures/tiny
+cd fuzz
+cargo +nightly fuzz run -s none -a dcp_dir /tmp/corpus/dcp_dir /tmp/seeds/dcp_dir -- \
+    -jobs=2 -workers=2 -rss_limit_mb=2048 -timeout=10 -max_total_time=1200
+```
+
+### Real models
+
+[Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) from the Hugging Face Hub:
+0.94 GiB of bf16 safetensors, 290 tensors, 14 query heads and 2 kv heads, tied embeddings. Every
+command below was run on it, then
+[`scripts/verify_real_model.py`](scripts/verify_real_model.py) checked the outputs against the original
+with torch 2.14.1 and transformers 5.18 on CPU:
+
+```bash
+M=./Qwen2.5-0.5B-Instruct; O=./out; R=examples/llama_tp_rules.yaml
+ckpt convert $M --to dcp --dcp-ranks 4 -o $O/dcp
+ckpt convert $O/dcp -o $O/rt.safetensors
+ckpt convert $O/dcp --to hf --max-shard-size 500MB -o $O/rt_hf
+ckpt reshard $M -o $O/sh500 --max-shard-size 500MB
+ckpt reshard $M -o $O/sh3 --num-shards 3
+ckpt reshard $M --tp 2 --rules $R -o $O/tp2
+ckpt reshard $O/tp2 -o $O/tp2_merged.safetensors
+ckpt reshard $M --tp 2 --rules $R --dtype fp16 -o $O/tp2_fp16
+ckpt convert $M -o $O/fp16.safetensors --dtype fp16
+ckpt convert $M -o $O/fp32.safetensors --dtype fp32
+ckpt convert $O/fp32.safetensors -o $O/bf16.safetensors --dtype bf16
+python scripts/verify_real_model.py $M $O "2" --logits
+```
+
+| Check | Result |
+|---|---|
+| DCP → safetensors, DCP → HF sharded, reshard by 500 MB and into 3 shards, TP2 → merge, fp32 → bf16 | all 290 tensors bit-identical to the original |
+| `--dtype fp16`, `--dtype fp32` | bit-identical to `t.to(torch.float16)` / `t.float()` |
+| TP2 split, with and without `--dtype fp16` | every tensor of every rank equals the torch slicing of the GQA rules |
+| logits (fp32, 18-token prompt) of the DCP round trip, the 500 MB reshard and the TP2 merge | identical to the original's (`torch.equal`, max \|diff\| 0) |
+| `ckpt diff` original vs round trip, DCP, TP2 merge | `RESULT: EQUAL`, exit 0; vs fp16: exit 1 |
+
+Time and peak RSS on Linux, from WSL2 ext4 with a warm page cache. The machine (an i9-13900H) was
+running fuzz jobs in the background at the time, so these numbers are pessimistic:
+
+| Command | Time | Peak RSS |
+|---|---:|---:|
+| `inspect --summary` | < 0.01 s | 11 MiB |
+| `convert` → DCP (4 ranks) | 3.1 s | 261 MiB |
+| `--verify inspect` DCP (CRC of every chunk) | 0.16 s | 947 MiB¹ |
+| `convert` DCP → safetensors | 0.8 s | 266 MiB |
+| `convert` DCP → HF sharded | 1.2 s | 266 MiB |
+| `reshard` into 3 shards | 0.8 s | 266 MiB |
+| `reshard --tp 2` (split) | 4.6 s | 260 MiB |
+| `reshard` TP2 → one file (merge) | 2.8 s | 955 MiB¹ |
+| `convert --dtype fp16` | 3.3 s | 285 MiB |
+| `convert --dtype fp32` | 4.0 s | 303 MiB |
+| `diff` original vs round trip | 2.1 s | 531 MiB |
+
+¹ The mapped pages of the files read stay resident (CRC of everything, all ranks of a tensor at
+once). They count in RSS, but they are clean page cache that the kernel can drop.
+
+On WSL2, read checkpoints from the Linux file system, not from a Windows drive such as `/mnt/c`: memory-mapped
+reads through drvfs run at about 20 MB/s, so `--dtype fp16` took 53 s instead of 3.3 s.
+
+### Platforms
+
+| Platform | Status |
+|---|---|
+| Linux x86_64 | CI: fmt, clippy, unit, CLI and hostile-input tests, and the DCP/dtype/TP pytest suites. Local (WSL2 Ubuntu): all pytest suites, fuzzing and the real-model checks |
+| Windows x86_64 | CI: fmt, clippy, unit, CLI and hostile-input tests (MSVC). The cross-built `x86_64-pc-windows-gnu` binary (MinGW, no extra DLLs) ran the same commands natively on Windows 11, on NTFS, for Qwen2.5-0.5B and Qwen2.5-1.5B. Every command succeeded with the expected exit codes. Peak working set is about the model size (0.95 GiB for 0.5B, 2.9 GiB for 1.5B), because on Windows the mapped pages are not released after each tensor; see the note below. A byte-for-byte comparison of the Windows and Linux outputs is pending |
+| macOS | CI-tested on GitHub's `macos-latest` runners: fmt, clippy, unit, CLI and hostile-input tests. Manual testing on an Apple Silicon machine is pending |
+
+**Memory on Windows.** On Unix, `ckpt` tells the kernel it is done with each tensor's source pages
+(`madvise(MADV_DONTNEED)`), so RSS stays near the largest tensor (measured on Linux). Windows has no
+equivalent for file mappings, so the peak working set grows to about the size of the files read: 2.9
+GiB to convert the 3.1 GB Qwen2.5-1.5B. These are clean, file-backed pages that Windows trims under
+memory pressure, not private allocations, but they show up as the process's memory use.
+
 ## Benchmarks
 
 The checkpoint was an FSDP2 DCP of about 121M fp32 params (461 MiB, GPT-2 style with 10 layers,
 d=768, vocab 32000) written by 4 gloo ranks. Measured with `scripts/bench.py` on an Intel i9-13900H,
-WSL2, ext4, warm page cache:
+WSL2, ext4, warm page cache, at the initial release. These tables were not re-measured after the
+hardening for 0.1; the Qwen2.5-0.5B timings in [Testing](#real-models) are current:
 
 | Task | Time | Peak RSS |
 |---|---:|---:|
@@ -387,7 +577,8 @@ These are not supported yet:
 - **Memory:** `diff` assembles non-contiguous tensors in memory, one tensor per thread at a time. It
   could compare chunk by chunk instead.
 - **Platforms:** the release binary is built and unit-tested on Linux, macOS and Windows by CI. The
-  end-to-end suites against real torch, Megatron and DeepSpeed run on Linux only.
+  end-to-end suites against real torch, Megatron and DeepSpeed run on Linux only. See
+  [Platforms](#platforms).
 
 ## S3 / GCS
 

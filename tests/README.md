@@ -3,6 +3,7 @@
 | Suite | Needs | Data |
 |---|---|---|
 | `src/**` unit tests + [`cli.rs`](cli.rs) | Rust only (`cargo test --release`) | the committed tiny fixtures in `fixtures/tiny` |
+| [`hostile.rs`](hostile.rs) | Rust only | hostile files built at test time, plus the minimized fuzzer findings in `fuzz_regressions/` |
 | [`test_roundtrip.py`](test_roundtrip.py) | CPU torch, transformers, safetensors, pytest | DCP/HF fixtures generated into `$CKPT_FIXTURES` |
 | [`test_formats.py`](test_formats.py) | as above, plus megatron-core and deepspeed for the Megatron/DeepSpeed tests | Megatron/DeepSpeed fixtures generated into `$CKPT_FIXTURES/{megatron,deepspeed}` |
 
