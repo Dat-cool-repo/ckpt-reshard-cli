@@ -18,7 +18,8 @@ plain `torch.save` files. It can:
 Tensors are memory-mapped and streamed, so `convert`, resharding and TP splitting need about as much
 memory as the largest tensor, not the whole model: converting the 0.94 GiB Qwen2.5-0.5B, whose
 largest tensor is 260 MiB, peaks at 260–300 MiB of RSS on Linux. Merging TP ranks and `diff` hold a few
-tensors at once (see [Testing](#testing)).
+tensors at once (see [Testing](#testing)). On macOS and Windows the mapped pages stay resident, so peak
+RSS is about the size of the files read; see [Platforms](#platforms).
 
 ```console
 $ ckpt inspect ./megatron_ckpt --summary
@@ -513,13 +514,16 @@ reads through drvfs run at about 20 MB/s, so `--dtype fp16` took 53 s instead of
 |---|---|
 | Linux x86_64 | CI: fmt, clippy, unit, CLI and hostile-input tests, and the DCP/dtype/TP pytest suites. Local (WSL2 Ubuntu): all pytest suites, fuzzing and the real-model checks |
 | Windows x86_64 | CI: fmt, clippy, unit, CLI and hostile-input tests (MSVC). The cross-built `x86_64-pc-windows-gnu` binary (MinGW, no extra DLLs) ran the same commands natively on Windows 11, on NTFS, for Qwen2.5-0.5B and Qwen2.5-1.5B. Every command succeeded with the expected exit codes. Peak working set is about the model size (0.95 GiB for 0.5B, 2.9 GiB for 1.5B), because on Windows the mapped pages are not released after each tensor; see the note below. A byte-for-byte comparison of the Windows and Linux outputs is pending |
-| macOS | CI-tested on GitHub's `macos-latest` runners: fmt, clippy, unit, CLI and hostile-input tests. Manual testing on an Apple Silicon machine is pending |
+| macOS arm64 | CI-tested on GitHub's `macos-latest` runners: fmt, clippy, unit, CLI and hostile-input tests. The release binary and `cargo install --git` ran the same commands natively on an Apple Silicon machine (M5 Pro, macOS 27, Rust 1.99) for Qwen2.5-0.5B: every command succeeded with the expected exit codes, the DCP round trip and the TP2 split + merge are bit-identical to the original (`diff` exit 0), and `rt.safetensors` and `tp2_merged.safetensors` have the same SHA-256. Peak RSS is about the model size (1.0 GiB for 0.5B) for the same reason as on Windows; see the note below |
 
-**Memory on Windows.** On Unix, `ckpt` tells the kernel it is done with each tensor's source pages
-(`madvise(MADV_DONTNEED)`), so RSS stays near the largest tensor (measured on Linux). Windows has no
-equivalent for file mappings, so the peak working set grows to about the size of the files read: 2.9
-GiB to convert the 3.1 GB Qwen2.5-1.5B. These are clean, file-backed pages that Windows trims under
-memory pressure, not private allocations, but they show up as the process's memory use.
+**Memory on Windows and macOS.** On Linux, `ckpt` tells the kernel it is done with each tensor's source
+pages (`madvise(MADV_DONTNEED)`), so RSS stays near the largest tensor. Windows has no equivalent for
+file mappings, and on macOS `madvise` accepts `MADV_DONTNEED` and `MADV_FREE` on a file mapping but does
+not drop the pages from the resident set (measured on macOS 27 with both `MAP_SHARED` and
+`MAP_PRIVATE`). On both, the peak working set therefore grows to about the size of the files read: 2.9
+GiB to convert the 3.1 GB Qwen2.5-1.5B on Windows, 1.0 GiB to convert Qwen2.5-0.5B on macOS. These are
+clean, file-backed pages that the OS trims under memory pressure, not private allocations, but they
+show up as the process's memory use.
 
 ## Benchmarks
 
